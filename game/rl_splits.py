@@ -3,18 +3,19 @@ rl_splits.py — Train / Val / Test splits for curriculum RL training.
 
 Split design
 ------------
-16 tracks fall into 4 difficulty groups (4 tracks each):
+20 tracks fall into 5 difficulty groups:
 
   Group A — Easy ovals          : tracks 1-4
   Group B — Rectangular shapes  : tracks 5-8
   Group C — Single special feat : tracks 9-12
   Group D — Complex polygons    : tracks 13-16
+  Group E — Single-lane (1 car) : tracks 17-20
 
 Stratified split: 2 train + 1 val + 1 test per group.
 
-  TRAIN  (8)  : [1,2, 5,6, 9,10, 13,14]  — curriculum progression
-  VAL    (4)  : [3,   7,   11,   15   ]  — performance gating, NOT trained on
-  TEST   (4)  : [4,   8,   12,   16   ]  — held out entirely, eval at the end
+  TRAIN  (10) : [1,2, 5,6, 9,10, 13,14, 17,18]  — curriculum progression
+  VAL    (5)  : [3,   7,   11,   15,    19   ]   — performance gating, NOT trained on
+  TEST   (5)  : [4,   8,   12,   16,    20   ]   — held out entirely, eval at the end
 
 Rationale
 ---------
@@ -24,6 +25,8 @@ Rationale
   whether the agent can transfer to unseen geometry at each tier.
 * Having representatives of every tier in every split avoids a mismatch where
   val/test are systematically harder than anything seen during training.
+* Group E (single-lane) is useful for multi-agent experiments where bottlenecks
+  force cars to negotiate single-file passage.
 
 Usage
 -----
@@ -73,9 +76,9 @@ def _get_splits():
     from .tracks import TRACKS          # TRACKS is 0-indexed, levels are 1-indexed
     by_level = {t.level: t for t in TRACKS}
 
-    train_levels = [1, 2,  5, 6,  9, 10,  13, 14]   # 2 per group, easy→hard
-    val_levels   = [3,     7,     11,     15      ]   # 1 per group, medium
-    test_levels  = [4,     8,     12,     16      ]   # 1 per group, hardest
+    train_levels = [1, 2,  5, 6,  9, 10,  13, 14,  17, 18]  # 2 per group, easy→hard
+    val_levels   = [3,     7,     11,     15,      19     ]  # 1 per group, medium
+    test_levels  = [4,     8,     12,     16,      20     ]  # 1 per group, hardest
 
     train = [by_level[l] for l in train_levels]
     val   = [by_level[l] for l in val_levels  ]
@@ -92,10 +95,11 @@ ALL_ORDERED = sorted(TRAIN + VAL + TEST, key=lambda t: t.level)
 # ── Difficulty metadata ───────────────────────────────────────────────────────
 
 DIFFICULTY = {
-    "A-easy":        {"tracks": [1, 2, 3, 4],   "description": "Full ovals"},
-    "B-medium-easy": {"tracks": [5, 6, 7, 8],   "description": "Rectangular shapes"},
-    "C-medium-hard": {"tracks": [9,10,11,12],   "description": "Hairpins & chicanes"},
-    "D-hard":        {"tracks": [13,14,15,16],  "description": "Complex polygons"},
+    "A-easy":        {"tracks": [1, 2, 3, 4],     "description": "Full ovals"},
+    "B-medium-easy": {"tracks": [5, 6, 7, 8],     "description": "Rectangular shapes"},
+    "C-medium-hard": {"tracks": [9,10,11,12],     "description": "Hairpins & chicanes"},
+    "D-hard":        {"tracks": [13,14,15,16],    "description": "Complex polygons"},
+    "E-single-lane": {"tracks": [17,18,19,20],   "description": "Single-lane (one car wide)"},
 }
 
 
@@ -548,7 +552,7 @@ class Evaluator:
 # ── Split summary (run as script) ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("\n16-Track Curriculum Splits")
+    print("\n20-Track Curriculum Splits")
     print("=" * 60)
 
     for split_name, split_tracks in [("TRAIN", TRAIN), ("VAL", VAL), ("TEST", TEST)]:

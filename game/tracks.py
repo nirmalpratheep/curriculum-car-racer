@@ -50,11 +50,16 @@ def _ipts(pts):
 # ────────────────────────────────────────────────────────────────────────────
 
 class TrackDef:
-    def __init__(self, level, name, waypoints, width, start_pos, start_angle, max_speed):
+    def __init__(self, level, name, waypoints, width, start_pos, start_angle, max_speed,
+                 segment_widths=None):
         self.level = level
         self.name = name
         self.waypoints = waypoints      # list of (x,y) floats
         self.width = width
+        # Per-segment widths for variable-width tracks (one value per waypoint,
+        # applied to the segment FROM that waypoint TO the next).
+        # None = uniform self.width everywhere.
+        self.segment_widths = segment_widths
         self.start_pos = start_pos      # (x, y) floats
         self.start_angle = start_angle  # degrees
         self.max_speed = max_speed
@@ -79,11 +84,23 @@ class TrackDef:
         # Expected lap time (frames) at 70 % of max speed — accounts for corners
         self.par_time_steps = self.optimal_dist / (max_speed * 0.70)
 
-        # Difficulty multiplier: narrow + fast = harder
-        # Track 1 (width=115, spd=3.0) → 1.0 | Track 16 (width=50, spd=4.5) → 3.45
+        # Difficulty multiplier: narrow + fast = harder.
+        # For variable-width tracks the *choke* (minimum segment) sets difficulty.
         _BASE_WIDTH = 115.0
         _BASE_SPEED = 3.0
-        self.complexity = (_BASE_WIDTH / width) * (max_speed / _BASE_SPEED)
+        eff_w = min(segment_widths) if segment_widths else width
+        self.complexity = (_BASE_WIDTH / eff_w) * (max_speed / _BASE_SPEED)
+
+        # Road width at the start/finish line (for checkered flag rendering).
+        # For variable-width tracks, find the width of the segment nearest to start.
+        if segment_widths is not None:
+            sx, sy = start_pos
+            nearest = min(range(len(waypoints)),
+                          key=lambda i: math.hypot(waypoints[i][0] - sx,
+                                                   waypoints[i][1] - sy))
+            self._start_road_width = segment_widths[nearest]
+        else:
+            self._start_road_width = width
 
     def _best_hud_corner(self, panel_w, panel_h, margin=8):
         """Return (x, y) of the screen corner with fewest track pixels under the HUD panel."""
@@ -113,31 +130,63 @@ class TrackDef:
         surf.fill(C_GRASS)
 
         ipts_list = _ipts(self.waypoints)
-        r      = self.width // 2
-        r_out  = r + BORDER
+        n = len(ipts_list)
 
-        # 1. White outer strip — sets both edge borders
-        pygame.draw.lines(surf, C_WHITE, True, ipts_list, self.width + BORDER * 2)
-        for pt in ipts_list:
-            pygame.draw.circle(surf, C_WHITE, pt, r_out)
+        if self.segment_widths is None:
+            # ── Uniform-width path (original behaviour) ──────────────────────
+            r      = self.width // 2
+            r_out  = r + BORDER
+            pygame.draw.lines(surf, C_WHITE, True, ipts_list, self.width + BORDER * 2)
+            for pt in ipts_list:
+                pygame.draw.circle(surf, C_WHITE, pt, r_out)
+            pygame.draw.lines(surf, C_TRACK, True, ipts_list, self.width)
+            for pt in ipts_list:
+                pygame.draw.circle(surf, C_TRACK, pt, r)
+        else:
+            # ── Variable-width path ───────────────────────────────────────────
+            # At each waypoint junction the circle radius is the max of the
+            # incoming and outgoing segment widths, ensuring no gaps at
+            # wide→narrow or narrow→wide transitions.
+            sw = self.segment_widths
 
-        # 2. Grey tarmac — covers centre, leaves white only at the two edges
-        pygame.draw.lines(surf, C_TRACK, True, ipts_list, self.width)
-        for pt in ipts_list:
-            pygame.draw.circle(surf, C_TRACK, pt, r)
+            # Pass 1: white outer strip
+            for i in range(n):
+                j   = (i + 1) % n
+                w   = sw[i] + BORDER * 2
+                w_p = sw[(i - 1) % n] + BORDER * 2
+                pygame.draw.line(surf, C_WHITE, ipts_list[i], ipts_list[j], w)
+                pygame.draw.circle(surf, C_WHITE, ipts_list[i], max(w, w_p) // 2)
 
-        # 3. Checkered start / finish line across the full road width
+            # Pass 2: grey tarmac
+            for i in range(n):
+                j   = (i + 1) % n
+                w   = sw[i]
+                w_p = sw[(i - 1) % n]
+                pygame.draw.line(surf, C_TRACK, ipts_list[i], ipts_list[j], w)
+                pygame.draw.circle(surf, C_TRACK, ipts_list[i], max(w, w_p) // 2)
+
+        # Checkered start / finish line across the full road width
         self._draw_start_finish(surf)
-
         self.surface = surf
 
         # Mask: covers the full road width (including border) so on_track
         # returns True all the way to the white edge lines.
         mask_surf = pygame.Surface((SCREEN_W, SCREEN_H))
         mask_surf.fill((0, 0, 0))
-        pygame.draw.lines(mask_surf, C_WHITE, True, ipts_list, self.width + BORDER * 2)
-        for pt in ipts_list:
-            pygame.draw.circle(mask_surf, C_WHITE, pt, r_out)
+        if self.segment_widths is None:
+            r_out = self.width // 2 + BORDER
+            pygame.draw.lines(mask_surf, C_WHITE, True, ipts_list,
+                               self.width + BORDER * 2)
+            for pt in ipts_list:
+                pygame.draw.circle(mask_surf, C_WHITE, pt, r_out)
+        else:
+            sw = self.segment_widths
+            for i in range(n):
+                j   = (i + 1) % n
+                w   = sw[i] + BORDER * 2
+                w_p = sw[(i - 1) % n] + BORDER * 2
+                pygame.draw.line(mask_surf, C_WHITE, ipts_list[i], ipts_list[j], w)
+                pygame.draw.circle(mask_surf, C_WHITE, ipts_list[i], max(w, w_p) // 2)
         self.mask = mask_surf
         self.hud_corner = self._best_hud_corner(330, 175)
 
@@ -156,7 +205,7 @@ class TrackDef:
         perp  = (math.cos(perp_rad),  math.sin(perp_rad))
         along = (math.cos(along_rad), math.sin(along_rad))
 
-        n_cols = self.width // CELL + 4   # slightly wider than road
+        n_cols = self._start_road_width // CELL + 4   # slightly wider than road
         half   = n_cols / 2.0
 
         for row in range(ROWS):
@@ -378,6 +427,98 @@ def _build_all_tracks():
         level=16, name="Master Challenge",
         waypoints=list(wp), width=50,
         start_pos=(660, 490), start_angle=180, max_speed=4.5
+    ))
+
+    # ── GROUP 5: Choke-and-catch-up tracks ──────────────────────────────────
+    # These tracks mix wide sections (cars race abreast, trailing car can close
+    # the gap) with narrow choke sections (single-file passage only).
+    # Layout pattern: wide catch-up zone → narrow choke → wide catch-up zone …
+    # Car body is 12 px wide; chokes are 22–28 px (just one car).
+
+    # 17. Two-Strait Bottleneck
+    # Stadium oval: two wide semicircular ends (75 px, side-by-side racing) and
+    # two narrow straights (22 px, single-file chokes).
+    # After clearing a strait the trailing car has the full wide arc to
+    # accelerate and close the gap before the next strait.
+    _CW, _CHK = 75, 22   # corner width, choke width
+    left_arc  = _arc(200, 300, 110, 110,  90, 270, 24)   # (200,410)→(200,190)
+    right_arc = _arc(700, 300, 110, 110, 270, 450, 24)  # (700,190)→(700,410)
+    wp = left_arc + right_arc   # 50 waypoints
+    # seg 24: top strait (200,190)→(700,190)  ← choke
+    # seg 49: bottom strait (700,410)→(200,410) ← choke
+    sw = [_CW] * 24 + [_CHK] + [_CW] * 24 + [_CHK]
+    tracks.append(TrackDef(
+        level=17, name="Two-Strait Bottleneck",
+        waypoints=wp, width=_CW,
+        start_pos=(450, 410), start_angle=180, max_speed=3.0,
+        segment_widths=sw
+    ))
+
+    # 18. Bottleneck Circuit
+    # Tighter stadium oval: wider corners (72 px) and two narrow straights
+    # (26 px).  Closer walls make the choke harder to navigate at speed.
+    _CW, _CHK = 72, 26
+    left_arc  = _arc(160, 300, 90, 90,  90, 270, 24)   # (160,390)→(160,210)
+    right_arc = _arc(740, 300, 90, 90, 270, 450, 24)  # (740,210)→(740,390)
+    wp = left_arc + right_arc   # 50 waypoints
+    sw = [_CW] * 24 + [_CHK] + [_CW] * 24 + [_CHK]
+    tracks.append(TrackDef(
+        level=18, name="Bottleneck Circuit",
+        waypoints=wp, width=_CW,
+        start_pos=(450, 390), start_angle=180, max_speed=3.2,
+        segment_widths=sw
+    ))
+
+    # 19. Chicane Alley
+    # Rounded rectangle (65 px wide) with a 3-gate chicane on the bottom
+    # straight (26 px).  The whole upper loop is the catch-up zone; the chicane
+    # forces sequential passage and the car that exits first can be chased down
+    # through the wide tl/tr arcs and the long top straight.
+    _MW, _CHK = 65, 26
+    tl_arc = _arc(250, 230, 110, 110, 180, 270, 16)   # (140,230)→(250,120)
+    tr_arc = _arc(650, 230, 110, 110, 270, 360, 16)   # (650,120)→(760,230)
+    br_arc = _arc(650, 370, 110, 110,   0,  90, 16)   # (760,370)→(650,480)
+    bl_arc = _arc(250, 370, 110, 110,  90, 180, 16)   # (250,480)→(140,370)
+    chicane = [
+        (650, 480), (570, 480), (535, 520),
+        (450, 520),
+        (365, 520), (330, 480), (250, 480),
+    ]
+    wp = tl_arc + tr_arc + br_arc + chicane + bl_arc   # 75 waypoints
+    # seg  16: top straight       (250,120)→(650,120)   wide
+    # seg  33: right straight     (760,230)→(760,370)   wide
+    # segs 34-49: br arc          wide
+    # seg  50: br end→chicane[0]  zero-length (same point)
+    # segs 51-56: chicane (6 segs, 26 px)  ← choke
+    # seg  57: chicane[-1]→bl[0]  zero-length (same point)
+    # seg  74: left straight      (140,370)→(140,230)   wide
+    sw = [_MW] * 51 + [_CHK] * 6 + [_MW] * 18
+    tracks.append(TrackDef(
+        level=19, name="Chicane Alley",
+        waypoints=wp, width=_MW,
+        start_pos=(450, 120), start_angle=0, max_speed=3.0,
+        segment_widths=sw
+    ))
+
+    # 20. Canyon Pass
+    # Angular rectangular course with a wide bottom straight (70 px, main
+    # catch-up zone) and two tight top-corridor segments (28 px chokes) flanking
+    # a slightly wider inner notch (55 px, secondary catch-up pocket).
+    wp = [
+        (760, 520), (140, 520),   # bottom straight  ← wide catch-up zone
+        (140, 160),               # left side up
+        (340, 160), (340, 340),   # inner notch left
+        (560, 340), (560, 160),   # inner notch right
+        (760, 160),               # right side top
+    ]
+    # seg 0: bottom (wide)  seg 2: top-left choke  seg 4: notch pocket
+    # seg 6: top-right choke  other segs: medium transitions
+    sw = [70, 40, 28, 40, 55, 40, 28, 40]
+    tracks.append(TrackDef(
+        level=20, name="Canyon Pass",
+        waypoints=wp, width=70,
+        start_pos=(450, 520), start_angle=180, max_speed=3.5,
+        segment_widths=sw
     ))
 
     return tracks

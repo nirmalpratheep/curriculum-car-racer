@@ -71,6 +71,46 @@ class Car:
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
 
+_RAY_ANGLES = [-90, -45, 0, 45, 90]
+_RAY_MAX    = 120
+_RAY_STEP   = 2
+
+# Colour gradient: red (close) → yellow → green (far)
+def _ray_colour(ratio):
+    r = int(255 * (1 - ratio))
+    g = int(255 * ratio)
+    return (r, g, 0)
+
+
+def draw_raycasts(surf, track, car):
+    """
+    Draw the 5 RL observation rays from the car.
+    Each ray is coloured green (far) → red (close) to show clearance.
+    Press V in game to toggle.
+    """
+    overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    for rel_deg in _RAY_ANGLES:
+        abs_rad = math.radians(car.angle + rel_deg)
+        dx = math.cos(abs_rad) * _RAY_STEP
+        dy = math.sin(abs_rad) * _RAY_STEP
+        px, py = car.x, car.y
+        dist = 0.0
+        while dist < _RAY_MAX:
+            px += dx
+            py += dy
+            dist += _RAY_STEP
+            if not track.on_track(px, py):
+                break
+        ratio  = dist / _RAY_MAX
+        colour = _ray_colour(ratio) + (180,)
+        end_x  = car.x + math.cos(abs_rad) * dist
+        end_y  = car.y + math.sin(abs_rad) * dist
+        pygame.draw.line(overlay, colour, (int(car.x), int(car.y)),
+                         (int(end_x), int(end_y)), 1)   # 1px line — subtle
+        pygame.draw.circle(overlay, colour, (int(end_x), int(end_y)), 2)  # 2px dot
+    surf.blit(overlay, (0, 0))
+
+
 def _draw_path(surf, pts, color, width=2):
     if len(pts) >= 2:
         ipts = [(int(x), int(y)) for x, y in pts]
@@ -89,7 +129,7 @@ def draw_hud(surf, track, car, race, fonts):
         f"   Total {race.total_elapsed():.2f}s"
         f"   Dist {race.current_distance:.0f}px"
         f"   Max {race._max_spd:.1f}"
-        f"   |  Arrows=drive  N/P=track  1-9=jump  R=restart  ESC=quit"
+        f"   |  Arrows=drive  N/P=track  1-9=jump  R=restart  V=rays  ESC=quit"
     )
 
     rendered = small.render(text, True, C_HUD)
@@ -152,6 +192,7 @@ class RaceState:
         self.car         = Car(track)
         self.state       = RACING
         self.attempts    = 1
+        self.show_rays   = False   # toggled with V
 
         self._lap_timer_started   = False  # starts on first key press per attempt
         self._total_timer_started = False  # starts on first key press ever
@@ -276,6 +317,8 @@ class RaceState:
         _draw_path(surf, self.current_path, C_BLUE, width=2)
 
         draw_headlights(surf, self.car.x, self.car.y, self.car.angle)
+        if self.show_rays:
+            draw_raycasts(surf, self.track, self.car)
         draw_car(surf, self.car.x, self.car.y, self.car.angle)
 
         if self.state == RACING:
@@ -322,6 +365,9 @@ def run(start_track=1):
                         race = new_race(track_idx)
                     else:
                         race.manual_reset()
+
+                elif event.key == pygame.K_v:
+                    race.show_rays = not race.show_rays
 
                 elif event.key == pygame.K_n:
                     track_idx = (track_idx + 1) % len(TRACKS)

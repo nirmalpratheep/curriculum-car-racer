@@ -143,13 +143,17 @@ class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
         reward: float,
         metadata: dict = None,
     ) -> RaceObservation:
+        # obs layout: [angular_velocity, speed, ray_left, ray_fl, ray_front, ray_fr, ray_right]
         image = self._render_headlight_image() if self._use_image else None
         return RaceObservation(
             image=image,
-            speed=obs[4],
-            on_track=obs[5],
-            sin_angle=obs[2],
-            cos_angle=obs[3],
+            angular_velocity=obs[0],
+            speed=obs[1],
+            ray_left=obs[2],
+            ray_front_left=obs[3],
+            ray_front=obs[4],
+            ray_front_right=obs[5],
+            ray_right=obs[6],
             done=done,
             reward=reward,
             metadata=metadata or {},

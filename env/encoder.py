@@ -4,7 +4,7 @@ Observation encoder for the car racing PPO agent.
 Input
 -----
 img     : (B, 3, 64, 64)  float32, pixels normalised to 0..1
-scalars : (B, 4)           float32, [speed, on_track, sin_angle, cos_angle]
+scalars : (B, 7)           float32, [angular_velocity, speed, ray×5]
 
 Output
 ------
@@ -23,7 +23,7 @@ ImpalaCNN  (Espeholt et al., IMPALA 2018)
   visual RL tasks at identical inference cost.
 
 Scalar MLP
-  4 → 32 → 32  (speed, on_track, sin/cos angle)
+  7 → 32 → 32  (angular_velocity, speed, ray×5)
 
 Combined
   cat([img_features, scalar_features])  →  288-d vector
@@ -109,7 +109,8 @@ class RaceEncoder(nn.Module):
         super().__init__()
         self.cnn = ImpalaCNN(out_features=img_features)
         self.scalar_mlp = nn.Sequential(
-            nn.Linear(4, scalar_features),
+            # 7 scalars: angular_velocity, speed, ray×5
+            nn.Linear(7, scalar_features),
             nn.ReLU(),
             nn.Linear(scalar_features, scalar_features),
             nn.ReLU(),
@@ -119,7 +120,9 @@ class RaceEncoder(nn.Module):
     def forward(self, img: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
         """
         img     : (B, 3, 64, 64)  float32  pixels / 255
-        scalars : (B, 4)           float32  [speed, on_track, sin_angle, cos_angle]
+        scalars : (B, 7)          float32  obs.scalars
+                  [angular_velocity, speed,
+                   ray_left, ray_front_left, ray_front, ray_front_right, ray_right]
         returns : (B, out_features)
         """
         return torch.cat([self.cnn(img), self.scalar_mlp(scalars)], dim=-1)

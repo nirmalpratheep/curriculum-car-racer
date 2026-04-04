@@ -94,8 +94,8 @@ def draw_headlights(surf, x, y, angle_deg):
 
     # Draw on alpha surface so it blends with track
     cone = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-    pygame.draw.polygon(cone, (255, 255, 180, 55), pts)   # soft yellow fill
-    pygame.draw.lines(cone, (255, 255, 180, 120), False, pts[1:], 1)  # edge glow
+    pygame.draw.polygon(cone, (255, 255, 180, 160), pts)  # yellow fill — visible to CNN
+    pygame.draw.lines(cone, (255, 255, 200, 220), False, pts[1:], 2)  # bright edge
     surf.blit(cone, (0, 0))
 
 

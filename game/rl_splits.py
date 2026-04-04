@@ -167,6 +167,7 @@ class CarEnv:
         self._prev_side  = 0.0
         self._laps       = 0
         self._step       = 0
+        self._angle_delta = 0.0   # degrees turned last step (for angular velocity obs)
         # lap metrics (reset each lap)
         self._lap_start_step = 0
         self._lap_dist       = 0.0
@@ -180,6 +181,7 @@ class CarEnv:
 
     @property
     def obs_size(self):
+        # angular_velocity, speed, ray×5
         return 7
 
     @property
@@ -195,6 +197,7 @@ class CarEnv:
         self._y     = float(self.track.start_pos[1])
         self._angle = float(self.track.start_angle)
         self._speed = 0.0
+        self._angle_delta    = 0.0
         self._prev_side      = self.track.gate_side(self._x, self._y)
         self._laps           = 0
         self._step           = 0
@@ -210,7 +213,9 @@ class CarEnv:
         accel = float(max(-1.0, min(1.0, action[0])))
         steer = float(max(-1.0, min(1.0, action[1])))
 
+        prev_angle = self._angle
         self._update_physics(accel, steer)
+        self._angle_delta = self._angle - prev_angle
         self._step += 1
 
         on        = self.track.on_track(self._x, self._y)
@@ -315,17 +320,44 @@ class CarEnv:
         self._x += self._speed * math.cos(rad)
         self._y += self._speed * math.sin(rad)
 
+    # Ray angles relative to heading (degrees). Covers lateral + diagonal + forward.
+    _RAY_ANGLES = [-90, -45, 0, 45, 90]
+    _RAY_MAX    = 120   # max ray length in px (normalise distances to 0..1)
+    _RAY_STEP   = 2     # step size in px
+
+    def _raycast(self):
+        """
+        Cast 5 rays from the car at fixed angles relative to heading.
+        Returns list of 5 floats in [0, 1]:
+            1.0 = boundary is MAX px away (clear road)
+            0.0 = boundary is right at the car (on the edge / off track)
+        Left/right rays give lateral clearance; diagonal/front give lookahead.
+        """
+        results = []
+        for rel_deg in self._RAY_ANGLES:
+            abs_rad = math.radians(self._angle + rel_deg)
+            dx = math.cos(abs_rad) * self._RAY_STEP
+            dy = math.sin(abs_rad) * self._RAY_STEP
+            px, py = self._x, self._y
+            dist = 0.0
+            while dist < self._RAY_MAX:
+                px += dx
+                py += dy
+                dist += self._RAY_STEP
+                if not self.track.on_track(px, py):
+                    break
+            results.append(dist / self._RAY_MAX)
+        return results
+
     def _obs(self):
-        t  = self.track
-        gs = self.track.gate_side(self._x, self._y)
+        t    = self.track
+        rays = self._raycast()   # 5 floats: left, front-left, front, front-right, right
+        # angular velocity: degrees turned this step, normalised by max possible turn
+        ang_vel = self._angle_delta / self.STEER_DEG   # ≈ [-1, 1]
         return [
-            self._x / 900.0,
-            self._y / 600.0,
-            math.sin(math.radians(self._angle)),
-            math.cos(math.radians(self._angle)),
+            ang_vel,
             self._speed / t.max_speed,
-            float(t.on_track(self._x, self._y)),
-            max(-1.0, min(1.0, gs / 500.0)),   # gate distance, normalised
+            *rays,
         ]
 
 

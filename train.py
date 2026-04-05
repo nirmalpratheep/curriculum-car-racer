@@ -66,6 +66,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 from env import CurriculumBuilder, DriveAction          # noqa: E402
 from env.encoder import RaceEncoder                     # noqa: E402
+from env.subproc_vec_env import SubprocVecEnv           # noqa: E402
 from game.rl_splits import difficulty_of                # noqa: E402
 
 
@@ -131,6 +132,9 @@ def parse_args():
     g.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
     g.add_argument("--compile", action="store_true",
                    help="torch.compile the model for faster CPU inference (requires PyTorch ≥ 2.0)")
+    g.add_argument("--subproc", action="store_true",
+                   help="Run each environment in its own subprocess (parallel env stepping). "
+                        "Recommended for GPU runs to improve utilisation.")
 
     return p.parse_args()
 
@@ -202,10 +206,13 @@ def obs_to_tensors(obs, device: torch.device):
 
 def obs_list_to_arrays(obs_list):
     """Batch-convert obs_list → numpy float32 arrays (CPU only, no GPU allocation).
-    Returns imgs (N, 3, H, W) float32 and scalars (N, 7) float32."""
+    Returns imgs (N, 3, H, W) float32 and scalars (N, 7) float32.
+    Accepts both RaceObservation objects and _StepResult namedtuples."""
     imgs = np.stack([obs.image for obs in obs_list], axis=0)          # (N, H, W, 3) uint8
     imgs = imgs.transpose(0, 3, 1, 2).astype(np.float32) / 255.0     # (N, 3, H, W) float32
-    scas = np.array([obs.scalars for obs in obs_list], dtype=np.float32)  # (N, 7)
+    # _StepResult.scalars is already a (7,) float32 array; RaceObservation.scalars is a list
+    scas_raw = [obs.scalars for obs in obs_list]
+    scas = np.array(scas_raw, dtype=np.float32)                       # (N, 7)
     return imgs, scas
 
 
@@ -406,10 +413,21 @@ def main():
     buf_values    = _buf(T, N)
 
     # ── Per-env episode state ─────────────────────────────────────────────────
-    envs          = [builder.next_env() for _ in range(N)]
-    obs_list      = [env.reset()        for env in envs]
-    current_track = [env._env.track     for env in envs]
-    is_replay     = [False]             * N
+    if args.subproc:
+        vec_env = SubprocVecEnv(N, max_steps=3000, laps_target=3)
+        init_tracks = [builder._sampler.sample() for _ in range(N)]
+        init_results = vec_env.reset([t.level for t in init_tracks])
+        # Convert _StepResult to a lightweight namespace compatible with obs_list API
+        obs_list      = list(init_results)
+        current_track = list(init_tracks)
+        envs          = None   # not used in subproc mode
+    else:
+        vec_env       = None
+        envs          = [builder.next_env() for _ in range(N)]
+        obs_list      = [env.reset()        for env in envs]
+        current_track = [env._env.track     for env in envs]
+
+    is_replay = [False] * N
 
     ep_reward   = [0.0] * N
     ep_length   = [0]   * N
@@ -437,16 +455,18 @@ def main():
         next_ckpt = float("inf")
 
     frontier = builder._sampler.frontier_track
+    env_mode = f"subproc ×{N}" if args.subproc else f"sequential ×{N}"
     print(f"Total steps : {args.total_steps:,}  (resuming from {global_step:,})" if ckpt
           else f"Total steps : {args.total_steps:,}")
+    print(f"Envs        : {env_mode}")
     print(f"Rollout     : {T} steps x {N} envs = {T*N} per update  |  "
           f"Minibatch: {args.minibatch_size}  |  Epochs: {args.ppo_epochs}")
     print(f"Curriculum  : threshold={args.threshold}  window={args.window}  replay={args.replay_frac}")
     print(f"Frontier    : track {frontier.level} '{frontier.name}'")
     print(f"W&B         : {run.url}\n")
-    print(f"{'Step':>10}  {'Track':>3}  {'Name':<22}  {'SPS':>5}  "
-          f"{'KL':>7}  {'Entropy':>7}  {'PG loss':>8}  {'VF loss':>7}")
-    print("-" * 82)
+    print(f"{'Step':>10}  {'lvl':>5}  {'Name':<20}  {'SPS':>9}  "
+          f"{'KL':>10}  {'Entropy':>10}  {'PG loss':>10}  {'VF loss':>8}  GPU")
+    print("-" * 100)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Training loop
@@ -480,13 +500,26 @@ def main():
             buf_logps[step]   = logps.cpu()
             buf_values[step]  = values.squeeze(-1).cpu()
 
-            # Step each env
-            for n in range(N):
-                clamped = actions[n].clamp(-1.0, 1.0)
-                obs = envs[n].step(
-                    DriveAction(accel=clamped[0].item(), steer=clamped[1].item())
+            # ── Step envs (parallel subprocess or sequential in-process) ─────
+            if vec_env is not None:
+                # Scatter actions to all workers simultaneously
+                clamped = actions.clamp(-1.0, 1.0).cpu()
+                vec_env.step_async(
+                    [(clamped[n, 0].item(), clamped[n, 1].item()) for n in range(N)]
                 )
-                obs_list[n]       = obs
+                step_results = vec_env.step_wait()
+            else:
+                step_results = []
+                for n in range(N):
+                    clamped_n = actions[n].clamp(-1.0, 1.0)
+                    step_results.append(
+                        envs[n].step(
+                            DriveAction(accel=clamped_n[0].item(), steer=clamped_n[1].item())
+                        )
+                    )
+
+            for n, obs in enumerate(step_results):
+                obs_list[n]          = obs
                 buf_rewards[step, n] = obs.reward
                 buf_dones[step, n]   = float(obs.done)
 
@@ -531,7 +564,7 @@ def main():
 
                     if advanced:
                         new_frontier = builder._sampler.frontier_track
-                        print(f"\n  > CURRICULUM ADVANCE ->  "
+                        print(f"\n\n  > CURRICULUM ADVANCE ->  "
                               f"Track {new_frontier.level} '{new_frontier.name}'  "
                               f"[level {builder.current_level}/{len(builder._sampler.tracks)-1}]")
                         print(f"    rolling_mean={rolling_mean:.2f}  "
@@ -578,15 +611,22 @@ def main():
                         print(f"  Val: mean_reward={val['mean_reward']:.1f}  "
                               f"completion={val['completion_rate']*100:.0f}%\n")
 
-                    # ── Reset env ────────────────────────────────────────────
+                    # ── Reset env for next episode ────────────────────────────
                     ep_reward[n] = ep_length[n] = ep_laps[n] = 0
                     ep_crashes[n] = ep_on_track[n] = 0
-                    envs[n]          = builder.next_env()
-                    current_track[n] = envs[n]._env.track
-                    is_replay[n]     = (
+
+                    if vec_env is not None:
+                        next_track       = builder._sampler.sample()
+                        obs_list[n]      = vec_env.reset_one(n, next_track.level)
+                        current_track[n] = next_track
+                    else:
+                        envs[n]          = builder.next_env()
+                        current_track[n] = envs[n]._env.track
+                        obs_list[n]      = envs[n].reset()
+
+                    is_replay[n] = (
                         current_track[n].level != builder._sampler.frontier_track.level
                     )
-                    obs_list[n] = envs[n].reset()
 
             global_step += N
 
@@ -725,18 +765,29 @@ def main():
             "system/elapsed_hours":     (time.time() - start_time) / 3600,
         }, step=global_step)
 
-        # ── Console output every 10 updates ──────────────────────────────────
-        if update_num % 10 == 0:
-            print(
-                f"{global_step:>10,}  "
-                f"{frontier_track.level:>3}  "
-                f"{frontier_track.name:<22}  "
-                f"{sps:>5.0f}  "
-                f"{mean_kl:>7.4f}  "
-                f"{mean_entropy:>7.3f}  "
-                f"{mean_pg:>+8.4f}  "
-                f"{mean_vf:>7.4f}"
-            )
+        # ── Console output every update (live-updating line) ─────────────────
+        if device.type == "cuda":
+            gpu_mem_used = torch.cuda.memory_allocated(device) / 1024**3
+            gpu_mem_tot  = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            try:
+                gpu_util = torch.cuda.utilization(device)
+                gpu_str  = f"  gpu={gpu_util:>3}%  mem={gpu_mem_used:.1f}/{gpu_mem_tot:.0f}GB"
+            except Exception:
+                gpu_str  = f"  mem={gpu_mem_used:.1f}/{gpu_mem_tot:.0f}GB"
+        else:
+            gpu_str = ""
+        print(
+            f"\r{global_step:>10,}  "
+            f"lvl={frontier_track.level:>2}  "
+            f"{frontier_track.name:<20}  "
+            f"{sps:>6.0f}sps  "
+            f"kl={mean_kl:.4f}  "
+            f"ent={mean_entropy:.3f}  "
+            f"pg={mean_pg:+.4f}  "
+            f"vf={mean_vf:.4f}"
+            f"{gpu_str}",
+            end="", flush=True,
+        )
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt:
@@ -753,7 +804,7 @@ def main():
                 wandb_run_id=run.id,
             )
             wandb.save(ckpt_path)
-            print(f"\n  [CKPT] {ckpt_path}\n")
+            print(f"\n\n  [CKPT] {ckpt_path}\n")
             next_ckpt += args.checkpoint_interval
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -770,6 +821,9 @@ def main():
         wandb_run_id=run.id,
     )
     wandb.save(final)
+
+    if vec_env is not None:
+        vec_env.close()
 
     elapsed = time.time() - start_time
     print(f"\n{'-'*82}")

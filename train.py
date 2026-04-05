@@ -278,7 +278,8 @@ def run_validation(
 
 def save_checkpoint(path: str, model, optimizer, global_step: int,
                     curriculum_level: int, args, reward_window, episode_num,
-                    sampler_idx, sampler_rewards, wandb_run_id=None):
+                    sampler_idx, sampler_rewards, sampler_crashes=None,
+                    wandb_run_id=None):
     torch.save({
         "step":             global_step,
         "curriculum_level": curriculum_level,
@@ -290,6 +291,7 @@ def save_checkpoint(path: str, model, optimizer, global_step: int,
         "episode_num":      episode_num,
         "sampler_idx":      sampler_idx,
         "sampler_rewards":  list(sampler_rewards),
+        "sampler_crashes":  list(sampler_crashes) if sampler_crashes is not None else [],
         "wandb_run_id":     wandb_run_id,
     }, path)
 
@@ -393,6 +395,8 @@ def main():
     if ckpt:
         builder._sampler._idx = ckpt["sampler_idx"]
         builder._sampler._rewards = deque(ckpt["sampler_rewards"],
+                                          maxlen=args.window)
+        builder._sampler._crashes = deque(ckpt.get("sampler_crashes", []),
                                           maxlen=args.window)
 
     # ── Rollout storage — shape (T, N, …) pre-allocated on CPU ───────────────
@@ -554,13 +558,15 @@ def main():
                         "curriculum/track_level":   current_track[n].level,
                         "curriculum/track_name":    current_track[n].name,
                         "curriculum/tier":          difficulty_of(current_track[n]),
-                        "curriculum/rolling_mean":  rolling_mean,
-                        "curriculum/threshold":     threshold,
-                        "curriculum/is_replay":     int(is_replay[n]),
+                        "curriculum/rolling_mean":   rolling_mean,
+                        "curriculum/threshold":      threshold,
+                        "curriculum/is_replay":      int(is_replay[n]),
+                        "curriculum/crashes_per_ep": builder._sampler.rolling_crashes,
+                        "curriculum/crash_free":     int(all(c == 0 for c in builder._sampler._crashes)),
                     }, step=global_step)
 
                     # ── Curriculum advancement check ─────────────────────────
-                    advanced = builder.record(ep_reward[n])
+                    advanced = builder.record(ep_reward[n], ep_crashes[n])
 
                     if advanced:
                         new_frontier = builder._sampler.frontier_track
@@ -801,6 +807,7 @@ def main():
                 reward_window, episode_num,
                 builder._sampler._idx,
                 list(builder._sampler._rewards),
+                sampler_crashes=list(builder._sampler._crashes),
                 wandb_run_id=run.id,
             )
             wandb.save(ckpt_path)
@@ -818,6 +825,7 @@ def main():
         reward_window, episode_num,
         builder._sampler._idx,
         list(builder._sampler._rewards),
+        sampler_crashes=list(builder._sampler._crashes),
         wandb_run_id=run.id,
     )
     wandb.save(final)

@@ -241,16 +241,22 @@ class CarEnv:
         # This prevents value-function miscalibration when replaying easy and
         # hard tracks in the same rollout buffer.
 
-        # 1. Tiny forward pulse — keeps agent from stalling
-        reward = self._speed / self.track.max_speed * 0.01
+        # 1. Forward momentum reward — strong enough to exceed threshold at ~50% speed,
+        #    creating a clear gradient toward acceleration.
+        #    Previous value (0.01) had a ceiling of 30/episode = exactly the threshold,
+        #    making the agent unable to advance without perfect full-speed driving.
+        reward = self._speed / self.track.max_speed * 0.05
 
         # 2. Off-track per-step penalty
+        #    Reduced from -0.5 to -0.2 so one crash is recoverable within the episode.
         if not on:
-            reward -= 0.5
+            reward -= 0.2
 
         # 3. Crash event penalty (on_track → off_track transition)
+        #    Reduced from -5.0 to -1.0 so the agent is not catastrophically
+        #    risk-averse. Still strong enough to discourage crashing.
         if self._was_on_track and not on:
-            reward -= 5.0
+            reward -= 1.0
             self._crash_count += 1
         self._was_on_track = on
 
@@ -397,6 +403,7 @@ class CurriculumSampler:
         self.replay_frac  = replay_frac
         self._idx         = 0              # current frontier index
         self._rewards     = deque(maxlen=window)
+        self._crashes     = deque(maxlen=window)   # crashes per episode
 
     @property
     def current_level(self):
@@ -420,44 +427,60 @@ class CurriculumSampler:
             return random.choice(self.mastered)
         return self.frontier_track
 
-    def record(self, episode_reward):
-        """Call after each episode with the total episode reward."""
+    def record(self, episode_reward, episode_crashes=0):
+        """Call after each episode with the total reward and crash count."""
         self._rewards.append(episode_reward)
+        self._crashes.append(episode_crashes)
 
     def should_advance(self):
         """
-        True if the agent has hit the threshold on the frontier track.
+        True when the agent has mastered the frontier track.
 
-        The effective threshold scales with track complexity so that the same
-        base threshold means "reliable good laps" regardless of track difficulty.
-        Rewards themselves are NOT scaled by complexity, so easy and hard track
-        episodes are comparable inside the same rollout buffer.
+        Two conditions must BOTH hold over the last `window` episodes:
 
-            effective_threshold = self.threshold × frontier_track.complexity
+          1. Crash-free window — every episode had zero crashes.
+             This is the primary mastery signal: the agent reliably stays on
+             track regardless of reward scale.
+
+          2. Reward threshold — rolling mean >= threshold × complexity.
+             Guards against advancing on a lucky crash-free streak at low speed
+             (e.g. slowly creeping around the track without going off).
+
+        Complexity scales the threshold so the same base value means
+        "solid driving" on both wide easy ovals and tight hard tracks.
         """
         if self._idx >= len(self.tracks) - 1:
             return False
         if len(self._rewards) < self.window:
             return False
-        effective = self.threshold * self.frontier_track.complexity
-        return statistics.mean(self._rewards) >= effective
+        crash_free = all(c == 0 for c in self._crashes)
+        effective  = self.threshold * self.frontier_track.complexity
+        return crash_free and statistics.mean(self._rewards) >= effective
 
     def advance(self):
-        """Move to the next track. Clears the rolling reward buffer."""
+        """Move to the next track. Clears the rolling reward and crash buffers."""
         if self._idx < len(self.tracks) - 1:
             self._idx += 1
             self._rewards.clear()
+            self._crashes.clear()
             return True
         return False
 
+    @property
+    def rolling_crashes(self):
+        """Mean crashes per episode over the current window."""
+        return statistics.mean(self._crashes) if self._crashes else float("nan")
+
     def status(self):
-        mean = statistics.mean(self._rewards) if self._rewards else float("nan")
-        t = self.frontier_track
+        mean     = statistics.mean(self._rewards) if self._rewards else float("nan")
+        crashes  = statistics.mean(self._crashes) if self._crashes else float("nan")
+        t        = self.frontier_track
         effective = self.threshold * t.complexity
+        crash_free = all(c == 0 for c in self._crashes) if self._crashes else False
         return (f"Frontier: track {t.level} '{t.name}'  "
                 f"[{self._idx+1}/{len(self.tracks)}]  "
-                f"rolling_mean={mean:.2f}  "
-                f"threshold={effective:.2f} (base={self.threshold:.2f} × C={t.complexity:.2f})")
+                f"rolling_mean={mean:.2f}  threshold={effective:.2f}  "
+                f"crashes/ep={crashes:.2f}  crash_free={crash_free}")
 
 
 # ── Evaluator ─────────────────────────────────────────────────────────────────

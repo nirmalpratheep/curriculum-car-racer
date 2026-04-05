@@ -46,6 +46,7 @@ Usage
 """
 
 import argparse
+import math
 import os
 import random
 import statistics
@@ -274,6 +275,91 @@ def run_validation(
         "mean_laps":       float(np.mean(all_laps)),
         "completion_rate": sum(all_done) / len(all_done),
     }
+
+
+def _topdown_frame(race_env) -> np.ndarray:
+    """
+    Render a top-down (bird's-eye) view of the track with the car overlaid.
+    Returns a (300, 450, 3) uint8 numpy array (half of 900×600 screen).
+    """
+    import pygame
+    surf = race_env._env.track.surface.copy()
+    x    = int(race_env._env._x)
+    y    = int(race_env._env._y)
+    ang  = race_env._env._angle
+
+    # Car body — red circle
+    pygame.draw.circle(surf, (220, 50, 50), (x, y), 8)
+    # Heading arrow — yellow line
+    rad = math.radians(ang)
+    tip = (int(x + 16 * math.cos(rad)), int(y + 16 * math.sin(rad)))
+    pygame.draw.line(surf, (255, 220, 0), (x, y), tip, 3)
+
+    # Scale 900×600 → 450×300
+    small = pygame.transform.scale(surf, (450, 300))
+    # surfarray gives (W, H, C); transpose to (H, W, C)
+    return pygame.surfarray.array3d(small).transpose(1, 0, 2).copy()
+
+
+@torch.no_grad()
+def log_inference_videos(
+    model:       PPOActorCritic,
+    builder:     CurriculumBuilder,
+    device:      torch.device,
+    global_step: int,
+    max_steps:   int = 2000,
+    frame_skip:  int = 4,
+) -> None:
+    """
+    Run one greedy episode on every TRAIN track up to the current frontier,
+    render top-down frames, and log as wandb.Video.
+
+    Called after each checkpoint so you can watch the agent improve over time
+    on all tracks it has been trained on.
+
+    Parameters
+    ----------
+    max_steps  : cap the episode at this many steps (default 2000 ≈ 2 laps)
+    frame_skip : only capture every Nth frame to keep video size manageable
+    """
+    import pygame
+    from game.rl_splits import _ensure_pygame, TRAIN
+    from env.environment import RaceEnvironment
+
+    _ensure_pygame()
+    model.eval()
+
+    # Render frontier track + all mastered tracks (index 0 … current_level)
+    n_tracks = builder.current_level + 1
+    video_logs = {}
+
+    for track in TRAIN[:n_tracks]:
+        track.build()
+        env = RaceEnvironment(track, max_steps=max_steps, laps_target=2, use_image=True)
+        obs = env.reset()
+
+        frames = [_topdown_frame(env)]   # capture first frame at reset
+        step   = 0
+
+        while not obs.done:
+            img, sca = obs_to_tensors(obs, device)
+            act, _, _, _ = model.get_action_and_value(img.unsqueeze(0), sca.unsqueeze(0))
+            obs  = env.step(DriveAction(
+                accel=act.clamp(-1, 1)[0, 0].item(),
+                steer=act.clamp(-1, 1)[0, 1].item(),
+            ))
+            step += 1
+            if step % frame_skip == 0:
+                frames.append(_topdown_frame(env))
+
+        # wandb.Video wants (T, H, W, C) uint8
+        video = np.stack(frames, axis=0)
+        key   = f"inference/track_{track.level:02d}_{track.name.replace(' ', '_')}"
+        video_logs[key] = wandb.Video(video, fps=20, format="mp4")
+
+    video_logs["global_step"] = global_step
+    wandb.log(video_logs, step=global_step)
+    model.train()
 
 
 def save_checkpoint(path: str, model, optimizer, global_step: int,
@@ -817,7 +903,10 @@ def main():
                 wandb_run_id=run.id,
             )
             wandb.save(ckpt_path)
-            print(f"\n\n  [CKPT] {ckpt_path}\n")
+            print(f"\n\n  [CKPT] {ckpt_path}")
+            print(f"  Rendering inference videos for {builder.current_level + 1} track(s)…")
+            log_inference_videos(model, builder, device, global_step)
+            print(f"  Videos logged to W&B.\n")
             next_ckpt += args.checkpoint_interval
 
     # ─────────────────────────────────────────────────────────────────────────

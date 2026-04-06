@@ -245,7 +245,7 @@ class CarEnv:
         # The agent learns to read rays/image BEFORE crossing the boundary.
         if not on:
             self._crash_count += 1
-            return self._obs(), -100.0, True, {
+            return self._obs(), -10.0, True, {
                 "lap":           self._laps,
                 "on_track":      False,
                 "step":          self._step,
@@ -263,20 +263,23 @@ class CarEnv:
             diff -= n
         elif diff < -n // 2:
             diff += n
-        reward = diff * self._progress_per_wp - 0.05
+        # Simple directional reward: +1 if moving toward next waypoint, -1 if wrong way.
+        # Accel is fixed at 1.0 externally so the car always moves — the only choice
+        # is steering direction.  Steering has no cost; only direction matters.
+        if diff > 0:
+            reward = 1.0
+        elif diff < 0:
+            reward = -1.0
+        else:
+            reward = 0.0
         self._wp_idx = new_wp
 
-        # Throttle bonus: reward forward acceleration, penalise unnecessary steering.
-        # accel > 0 (throttle) → small positive; steer ≠ 0 → small penalty.
-        # This makes "go straight with throttle" strictly better than "spin left/right".
-        # Penalty is proportional to |steer| so gentle corrections cost less than
-        # full lock turns.
-        reward += accel * 0.05                  # throttle bonus: up to +0.05
-        reward -= abs(steer) * 0.02             # steering cost: up to -0.02
-
-        # Lap completion
+        # Lap completion — requires the car to have physically traveled most of the
+        # track since the last lap. This blocks the shortcut where the agent reverses
+        # a few steps to get behind the gate, then drives forward for an instant +100.
         lap_done = (self._prev_side < -5.0 and curr_side >= 0.0
-                    and self._speed > 0.3)
+                    and self._speed > 0.3
+                    and self._lap_dist >= self.track.optimal_dist * 0.8)
         if lap_done:
             self._laps    += 1
             reward        += 100.0
@@ -288,11 +291,9 @@ class CarEnv:
 
         out_of_bounds = not (0 <= self._x < 900 and 0 <= self._y < 600)
         if out_of_bounds:
-            reward -= 100.0
+            reward = -10.0
 
-        done = (out_of_bounds
-                or self._step >= self.max_steps
-                or self._laps >= self.laps_target)
+        done = out_of_bounds  # only crash/OOB ends the episode; no step/lap limit
 
         return self._obs(), reward, done, {
             "lap":           self._laps,
@@ -366,10 +367,25 @@ class CarEnv:
         t    = self.track
         rays = self._raycast()   # 5 floats: left, front-left, front, front-right, right
         ang_vel = self._angle_delta / self.STEER_DEG   # ≈ [-1, 1]
+
+        # GPS: direction to the NEXT waypoint relative to the car's current heading.
+        # sin < 0 → waypoint is to the left  (steer left)
+        # sin > 0 → waypoint is to the right (steer right)
+        # cos ≈ 1 → waypoint is straight ahead (keep going)
+        next_idx = (self._wp_idx + 10) % self._n_wps
+        dx = self._wp_x[next_idx] - self._x
+        dy = self._wp_y[next_idx] - self._y
+        world_angle_rad = math.atan2(dy, dx)
+        rel_angle_rad   = world_angle_rad - math.radians(self._angle)
+        wp_sin = math.sin(rel_angle_rad)
+        wp_cos = math.cos(rel_angle_rad)
+
         return [
             ang_vel,
             self._speed / t.max_speed,
             *rays,
+            wp_sin,   # GPS direction sin component
+            wp_cos,   # GPS direction cos component
         ]
 
 

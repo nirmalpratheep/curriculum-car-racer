@@ -158,6 +158,8 @@ class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
             ray_front=obs[4],
             ray_front_right=obs[5],
             ray_right=obs[6],
+            wp_sin=obs[7],
+            wp_cos=obs[8],
             done=done,
             reward=reward,
             metadata=metadata or {},

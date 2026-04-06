@@ -61,7 +61,7 @@ class RaceObservation(Observation):
 
     image: Optional[Any] = None   # np.ndarray (64, 64, 3) uint8
 
-    # scalar branch — 7 values total
+    # scalar branch — 9 values total
     speed: float = 0.0
     angular_velocity: float = 0.0
     ray_left: float = 1.0
@@ -69,6 +69,8 @@ class RaceObservation(Observation):
     ray_front: float = 1.0
     ray_front_right: float = 1.0
     ray_right: float = 1.0
+    wp_sin: float = 0.0   # sin of angle to next waypoint (relative to heading)
+    wp_cos: float = 1.0   # cos of angle to next waypoint (1.0 = straight ahead)
 
     @property
     def scalars(self) -> List[float]:
@@ -81,4 +83,6 @@ class RaceObservation(Observation):
             self.ray_front,
             self.ray_front_right,
             self.ray_right,
+            self.wp_sin,
+            self.wp_cos,
         ]

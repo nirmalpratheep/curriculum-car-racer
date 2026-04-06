@@ -35,7 +35,7 @@ _CMD_CLOSE = 2
 class _StepResult(NamedTuple):
     """Compact observation sent from worker to main process each step."""
     image:           np.ndarray        # (64, 64, 3) uint8
-    scalars:         np.ndarray        # (7,) float32: speed, ang_vel, 5 rays
+    scalars:         np.ndarray        # (9,) float32: speed, ang_vel, 5 rays, wp_sin, wp_cos
     reward:          float
     done:            bool
     metadata:        dict

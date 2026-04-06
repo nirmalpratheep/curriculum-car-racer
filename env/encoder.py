@@ -109,8 +109,8 @@ class RaceEncoder(nn.Module):
         super().__init__()
         self.cnn = ImpalaCNN(out_features=img_features)
         self.scalar_mlp = nn.Sequential(
-            # 7 scalars: angular_velocity, speed, ray×5
-            nn.Linear(7, scalar_features),
+            # 9 scalars: angular_velocity, speed, ray×5, wp_sin, wp_cos
+            nn.Linear(9, scalar_features),
             nn.ReLU(),
             nn.Linear(scalar_features, scalar_features),
             nn.ReLU(),

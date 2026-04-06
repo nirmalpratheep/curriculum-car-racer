@@ -538,7 +538,7 @@ def main():
 
     # Image/scalar stored as numpy — avoids D2H round-trip during collection
     buf_imgs_np    = np.zeros((T, N, 3, 64, 64), dtype=np.float32)
-    buf_scalars_np = np.zeros((T, N, 7),         dtype=np.float32)
+    buf_scalars_np = np.zeros((T, N, 9),         dtype=np.float32)
     buf_actions   = _buf(T, N, 2)
     buf_logps     = _buf(T, N)
     buf_rewards   = _buf(T, N)
@@ -547,7 +547,7 @@ def main():
 
     # ── Per-env episode state ─────────────────────────────────────────────────
     if args.subproc:
-        vec_env = SubprocVecEnv(N, max_steps=3000, laps_target=3)
+        vec_env = SubprocVecEnv(N, max_steps=500_000, laps_target=1)
         init_tracks = [builder._sampler.sample() for _ in range(N)]
         init_results = vec_env.reset([t.level for t in init_tracks])
         # Convert _StepResult to a lightweight namespace compatible with obs_list API
@@ -642,20 +642,21 @@ def main():
             buf_values[step]  = values.squeeze(-1).cpu()
 
             # ── Step envs (parallel subprocess or sequential in-process) ─────
+            # Accel is fixed at 1.0: the car always moves forward at full throttle.
+            # The policy only controls steering; the accel output dimension is ignored.
             if vec_env is not None:
-                # Scatter actions to all workers simultaneously
-                clamped = actions.clamp(-1.0, 1.0).cpu()
+                steer = actions.clamp(-1.0, 1.0).cpu()
                 vec_env.step_async(
-                    [(clamped[n, 0].item(), clamped[n, 1].item()) for n in range(N)]
+                    [(1.0, steer[n, 1].item()) for n in range(N)]
                 )
                 step_results = vec_env.step_wait()
             else:
                 step_results = []
                 for n in range(N):
-                    clamped_n = actions[n].clamp(-1.0, 1.0)
+                    steer_n = actions[n, 1].clamp(-1.0, 1.0).item()
                     step_results.append(
                         envs[n].step(
-                            DriveAction(accel=clamped_n[0].item(), steer=clamped_n[1].item())
+                            DriveAction(accel=1.0, steer=steer_n)
                         )
                     )
 
@@ -809,7 +810,7 @@ def main():
         # Single pinned H2D transfer for image/scalar buffers
         b_img  = (torch.from_numpy(buf_imgs_np.reshape(TN, 3, 64, 64))
                   .pin_memory().to(device, non_blocking=True))
-        b_sca  = (torch.from_numpy(buf_scalars_np.reshape(TN, 7))
+        b_sca  = (torch.from_numpy(buf_scalars_np.reshape(TN, 9))
                   .pin_memory().to(device, non_blocking=True))
         b_act  = buf_actions.view(TN, 2).to(device, non_blocking=True)
         b_logp = buf_logps.view(TN).to(device, non_blocking=True)

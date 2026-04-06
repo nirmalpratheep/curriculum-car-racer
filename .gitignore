@@ -11,3 +11,7 @@ wheels/
 .env
 wandb
 checkpoints
+inference_videos
+*.log
+*.npy
+*.mp4

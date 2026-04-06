@@ -123,7 +123,11 @@ def parse_args():
     g = p.add_argument_group("Checkpointing")
     g.add_argument("--checkpoint-interval", type=int, default=500_000,
                    help="Save a .pt every N global steps (0 = disabled)")
+    g.add_argument("--video-interval",    type=int, default=25_000,
+                   help="Log inference videos every N global steps (0 = only at checkpoints)")
     g.add_argument("--checkpoint-dir",      default="checkpoints")
+    g.add_argument("--keep-checkpoints",  type=int, default=5,
+                   help="Keep only the last N checkpoints on disk (0 = keep all)")
     g.add_argument("--resume",              default=None,
                    help="Path to a checkpoint .pt file to resume from")
 
@@ -159,12 +163,24 @@ class PPOActorCritic(nn.Module):
         D                  = self.encoder.out_features  # 288
 
         self.actor_mean    = nn.Linear(D, 2)
-        self.actor_log_std = nn.Parameter(torch.zeros(2))
+        # Start with smaller std (exp(-1) ≈ 0.37) so the initial policy
+        # doesn't steer wildly.  With std=1.0 the car veers off-track before
+        # it can learn anything.
+        # Clamped in forward pass to [-3.0, -0.3] (std ∈ [0.05, 0.74]) to
+        # prevent the entropy bonus from pushing std back toward 1.0.
+        self.actor_log_std = nn.Parameter(torch.full((2,), -1.0))
         self.critic        = nn.Linear(D, 1)
 
         # Orthogonal init keeps early training stable
         nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
         nn.init.zeros_(self.actor_mean.bias)
+        # Bias the initial policy toward gentle forward acceleration.
+        # With brake_force(0.22) > accel_force(0.13), a zero-mean Gaussian
+        # causes net deceleration → car stops → zero reward → no learning.
+        # Bias of 0.3 keeps the car moving at moderate speed so it stays
+        # on-track long enough to receive on-track and progress rewards.
+        with torch.no_grad():
+            self.actor_mean.bias[0] = 0.3   # accel dimension
         nn.init.orthogonal_(self.critic.weight,     gain=1.0)
         nn.init.zeros_(self.critic.bias)
 
@@ -179,7 +195,8 @@ class PPOActorCritic(nn.Module):
     ):
         feat    = self.encoder(img, scalars)
         mean    = self.actor_mean(feat)
-        std     = self.actor_log_std.exp().expand_as(mean)
+        log_std = self.actor_log_std.clamp(-3.0, -0.3)
+        std     = log_std.exp().expand_as(mean)
         dist    = Normal(mean, std)
 
         if action is None:
@@ -307,27 +324,31 @@ def log_inference_videos(
     builder:     CurriculumBuilder,
     device:      torch.device,
     global_step: int,
+    video_dir:   str = "inference_videos",
     max_steps:   int = 2000,
     frame_skip:  int = 4,
 ) -> None:
     """
     Run one greedy episode on every TRAIN track up to the current frontier,
-    render top-down frames, and log as wandb.Video.
+    render top-down frames, save locally as MP4, and log to W&B.
 
-    Called after each checkpoint so you can watch the agent improve over time
-    on all tracks it has been trained on.
+    Called at every --video-interval so you can watch the agent improve over
+    time on all tracks it has been trained on.
 
     Parameters
     ----------
+    video_dir  : directory for local MP4 files (auto-created)
     max_steps  : cap the episode at this many steps (default 2000 ≈ 2 laps)
     frame_skip : only capture every Nth frame to keep video size manageable
     """
     import pygame
+    import imageio.v3 as iio
     from game.rl_splits import _ensure_pygame, TRAIN
     from env.environment import RaceEnvironment
 
     _ensure_pygame()
     model.eval()
+    os.makedirs(video_dir, exist_ok=True)
 
     # Render frontier track + all mastered tracks (index 0 … current_level)
     n_tracks = builder.current_level + 1
@@ -352,14 +373,22 @@ def log_inference_videos(
             if step % frame_skip == 0:
                 frames.append(_topdown_frame(env))
 
-        # wandb.Video wants (T, H, W, C) uint8
+        # (T, H, W, C) uint8
         video = np.stack(frames, axis=0)
-        key   = f"inference/track_{track.level:02d}_{track.name.replace(' ', '_')}"
+
+        # Save locally as MP4
+        track_slug = track.name.replace(' ', '_')
+        filename = f"step{global_step:08d}_track{track.level:02d}_{track_slug}.mp4"
+        local_path = os.path.join(video_dir, filename)
+        iio.imwrite(local_path, video, fps=20, codec="libx264", plugin="pyav")
+
+        key = f"inference/track_{track.level:02d}_{track_slug}"
         video_logs[key] = wandb.Video(video, fps=20, format="mp4")
 
     video_logs["global_step"] = global_step
     wandb.log(video_logs, step=global_step)
     model.train()
+    print(f"  Saved {n_tracks} video(s) to {video_dir}/")
 
 
 def save_checkpoint(path: str, model, optimizer, global_step: int,
@@ -389,6 +418,17 @@ def load_checkpoint(path: str):
     print(f"  [RESUME] Resuming from step {ckpt['step']:,}  "
           f"curriculum level {ckpt['curriculum_level']}\n")
     return ckpt
+
+
+def prune_checkpoints(checkpoint_dir: str, keep: int):
+    """Delete oldest checkpoints, keeping only the most recent `keep` files."""
+    if keep <= 0:
+        return
+    import glob as _glob
+    pts = sorted(_glob.glob(os.path.join(checkpoint_dir, "ppo_step*.pt")))
+    for old in pts[:-keep]:
+        os.remove(old)
+        print(f"  [PRUNE] Removed old checkpoint: {os.path.basename(old)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,6 +586,14 @@ def main():
             next_ckpt += args.checkpoint_interval
     else:
         next_ckpt = float("inf")
+
+    # Next video threshold (independent of checkpoints)
+    if args.video_interval > 0:
+        next_video = args.video_interval
+        while next_video <= global_step:
+            next_video += args.video_interval
+    else:
+        next_video = float("inf")
 
     frontier = builder._sampler.frontier_track
     env_mode = f"subproc ×{N}" if args.subproc else f"sequential ×{N}"
@@ -886,6 +934,13 @@ def main():
             end="", flush=True,
         )
 
+        # ── Inference video ────────────────────────────────────────────────────
+        if global_step >= next_video:
+            print(f"\n  [VIDEO] Rendering inference videos for {builder.current_level + 1} track(s)…")
+            log_inference_videos(model, builder, device, global_step)
+            print(f"  Videos logged to W&B.\n")
+            next_video += args.video_interval
+
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt:
             ckpt_path = os.path.join(
@@ -904,9 +959,8 @@ def main():
             )
             wandb.save(ckpt_path)
             print(f"\n\n  [CKPT] {ckpt_path}")
-            print(f"  Rendering inference videos for {builder.current_level + 1} track(s)…")
-            log_inference_videos(model, builder, device, global_step)
-            print(f"  Videos logged to W&B.\n")
+            if args.keep_checkpoints > 0:
+                prune_checkpoints(args.checkpoint_dir, args.keep_checkpoints)
             next_ckpt += args.checkpoint_interval
 
     # ─────────────────────────────────────────────────────────────────────────

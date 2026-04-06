@@ -128,9 +128,11 @@ class CarEnv:
     Reward (scale-invariant — NOT multiplied by complexity):
 
         Per step
-          + speed/max_speed * 0.01     tiny forward pulse
-          - 0.5   per step off track   discourages leaving road
-          - 5.0   on crash event       penalises each on→off transition
+          + 0.05 + speed/max_speed * 0.15   on-track bonus + speed reward
+          - 0.1   per step off track        off-track penalty
+          - 1.0   on crash event            penalises each on→off transition
+          + waypoint_advance * (5.0 / n_waypoints)   dense progress signal
+              only while on-track; rewards advancing along the centerline
 
         On lap completion
           + 50 * time_ratio * dist_ratio
@@ -160,6 +162,12 @@ class CarEnv:
     FRICTION    = 0.038
     STEER_DEG   = 2.7
 
+    # Reward per waypoint advance = PROGRESS_SCALE / n_waypoints.
+    # Tuned so a full lap of progress ≈ 15.0 reward — must be comparable to
+    # the speed reward (~28 for a fast straight) so the agent is incentivised
+    # to drive the FULL track, not just blast a straight and stop at curves.
+    PROGRESS_SCALE = 15.0
+
     def __init__(self, track, max_steps=3000, laps_target=3):
         _ensure_pygame()
         self.track = track
@@ -167,11 +175,21 @@ class CarEnv:
         self.laps_target = laps_target
         track.build()
 
+        # Pre-compute waypoint data for progress reward
+        wps = track.waypoints
+        self._n_wps = len(wps)
+        self._wp_x = [w[0] for w in wps]
+        self._wp_y = [w[1] for w in wps]
+        # Reward per waypoint = total_progress_reward / n_waypoints
+        self._progress_per_wp = self.PROGRESS_SCALE / self._n_wps
+
         self._x = self._y = self._angle = self._speed = 0.0
         self._prev_side  = 0.0
         self._laps       = 0
         self._step       = 0
         self._angle_delta = 0.0   # degrees turned last step (for angular velocity obs)
+        # waypoint progress tracking
+        self._wp_idx     = 0      # nearest waypoint index (advances forward)
         # lap metrics (reset each lap)
         self._lap_start_step = 0
         self._lap_dist       = 0.0
@@ -200,15 +218,15 @@ class CarEnv:
         self._x     = float(self.track.start_pos[0])
         self._y     = float(self.track.start_pos[1])
         self._angle = float(self.track.start_angle)
-        # Start at 40% max speed so the agent immediately experiences motion
-        # and receives a meaningful speed reward from step 0.
-        # A zero-start policy converges to near-zero speed because brake
-        # force (0.22) > accel force (0.13), so random actions decelerate.
-        self._speed = self.track.max_speed * 0.4
+        # Start at 20% max speed — enough to feel motion and receive the
+        # on-track speed bonus, but slow enough to survive the first curve
+        # while the agent is still learning to steer.
+        self._speed = self.track.max_speed * 0.2
         self._angle_delta    = 0.0
         self._prev_side      = self.track.gate_side(self._x, self._y)
         self._laps           = 0
         self._step           = 0
+        self._wp_idx         = self._nearest_wp(self._x, self._y)
         self._lap_start_step = 0
         self._lap_dist       = 0.0
         self._lap_prev_x     = self._x
@@ -245,16 +263,17 @@ class CarEnv:
         # This prevents value-function miscalibration when replaying easy and
         # hard tracks in the same rollout buffer.
 
-        # 1. Forward momentum reward — strong enough to exceed threshold at ~50% speed,
-        #    creating a clear gradient toward acceleration.
-        #    Previous value (0.01) had a ceiling of 30/episode = exactly the threshold,
-        #    making the agent unable to advance without perfect full-speed driving.
-        reward = self._speed / self.track.max_speed * 0.05
-
-        # 2. Off-track per-step penalty
-        #    Reduced from -0.5 to -0.2 so one crash is recoverable within the episode.
-        if not on:
-            reward -= 0.2
+        # 1. On-track speed reward — reward is proportional to forward speed.
+        #    Zero speed on track earns nothing, preventing the zero-speed
+        #    local optimum where the agent just sits on the road.
+        speed_frac = self._speed / self.track.max_speed
+        if on:
+            # Pure speed reward: must move to earn anything.
+            # At zero speed: 0/step.  At max speed: +0.20/step.
+            reward = speed_frac * 0.20
+        else:
+            # Off-track: fixed penalty, no speed reward.
+            reward = -0.1
 
         # 3. Crash event penalty (on_track → off_track transition)
         #    Reduced from -5.0 to -1.0 so the agent is not catastrophically
@@ -264,9 +283,19 @@ class CarEnv:
             self._crash_count += 1
         self._was_on_track = on
 
-        # 4. Lap completion — main signal
+        # 4. Waypoint progress — dense directional signal
+        #    Rewards forward progress along the track centerline so the agent
+        #    has a gradient toward lap completion, not just speed in any direction.
+        #    Only awarded while on track to prevent off-road shortcuts.
+        new_wp = self._nearest_wp(self._x, self._y)
+        if on:
+            advance = self._wp_advance(self._wp_idx, new_wp)
+            reward += advance * self._progress_per_wp
+        self._wp_idx = new_wp
+
+        # 5. Lap completion — main signal
         lap_done = (self._prev_side < -5.0 and curr_side >= 0.0
-                    and abs(self._speed) > 0.3)
+                    and self._speed > 0.3)
         if lap_done:
             self._laps += 1
 
@@ -311,6 +340,29 @@ class CarEnv:
         }
 
     # ── Internal ─────────────────────────────────────────────────────────────
+
+    def _nearest_wp(self, x, y):
+        """Return index of the nearest waypoint to (x, y)."""
+        best_i, best_d2 = 0, float("inf")
+        for i in range(self._n_wps):
+            d2 = (x - self._wp_x[i]) ** 2 + (y - self._wp_y[i]) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        return best_i
+
+    def _wp_advance(self, old_idx, new_idx):
+        """
+        Signed number of waypoints advanced (positive = forward, negative = backward).
+        Handles wraparound: if the car crosses the 0-boundary, the shorter arc is used.
+        """
+        diff = new_idx - old_idx
+        n = self._n_wps
+        if diff > n // 2:
+            diff -= n
+        elif diff < -n // 2:
+            diff += n
+        return diff
 
     def _update_physics(self, accel, steer):
         ms = self.track.max_speed

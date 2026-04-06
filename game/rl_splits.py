@@ -180,6 +180,7 @@ class CarEnv:
 
         self._x = self._y = self._angle = self._speed = 0.0
         self._prev_side   = 0.0
+        self._gate_armed  = False  # True once car is 50px past start line
         self._laps        = 0
         self._step        = 0
         self._angle_delta = 0.0
@@ -211,6 +212,7 @@ class CarEnv:
         self._speed = self.track.max_speed * 0.2
         self._angle_delta  = 0.0
         self._prev_side    = self.track.gate_side(self._x, self._y)
+        self._gate_armed   = False
         self._laps         = 0
         self._step         = 0
         self._wp_idx       = self._nearest_wp(self._x, self._y)
@@ -295,17 +297,23 @@ class CarEnv:
             reward -= 0.25 * abs(diff)   # -0.25 per waypoint lost going backward
         self._wp_idx = new_wp
 
-        # Lap completion — requires the car to have physically traveled most of
-        # the track since the last lap (anti-shortcut gate).
-        lap_done = (self._prev_side < -5.0 and curr_side >= 0.0
+        # Lap completion — two-phase arm/trigger to reliably detect crossings.
+        # Phase 1 (arm): car must travel 50px past the gate going forward.
+        # Phase 2 (trigger): car crosses back through the gate (prev<0 → curr>=0).
+        # Anti-shortcut gate: must have traveled 80% of optimal lap distance.
+        if not self._gate_armed and curr_side > 50.0:
+            self._gate_armed = True
+        lap_done = (self._gate_armed
+                    and self._prev_side < 0.0 and curr_side >= 0.0
                     and self._speed > 0.3
                     and self._lap_dist >= self.track.optimal_dist * 0.8)
         if lap_done:
-            self._laps    += 1
-            reward        += 10.0    # target-reached bonus
-            self._lap_dist = 0.0
-            self._lap_prev_x = self._x
-            self._lap_prev_y = self._y
+            self._laps       += 1
+            self._gate_armed  = False   # re-arm for next lap
+            reward           += 10.0    # target-reached bonus
+            self._lap_dist    = 0.0
+            self._lap_prev_x  = self._x
+            self._lap_prev_y  = self._y
 
         self._prev_side = curr_side
 
@@ -476,14 +484,14 @@ class CurriculumSampler:
 
     def should_advance(self):
         """
-        True when every episode in the window completed ≥1 lap with zero crashes.
-        Advancement is purely crash-based — reward scale changes do not affect it.
+        True when every episode in the window completed a lap with zero crashes.
+        Both conditions must hold for every episode: laps >= 1 AND crashes == 0.
         """
         if self._idx >= len(self.tracks) - 1:
             return False
-        if len(self._laps) < self.window:
+        if len(self._crashes) < self.window:
             return False
-        return all(l >= 1 for l in self._laps) and all(c == 0 for c in self._crashes)
+        return all(l >= 1 and c == 0 for l, c in zip(self._laps, self._crashes))
 
     def advance(self):
         """Move to the next track. Clears all rolling buffers."""

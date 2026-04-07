@@ -78,6 +78,8 @@ def parse_args():
     g = p.add_argument_group("W&B")
     g.add_argument("--wandb-project",  default="curriculum-car-racer")
     g.add_argument("--wandb-run-name", default=None)
+    g.add_argument("--wandb-id",       default=None,
+                   help="Existing W&B run ID to resume (logs continue in the same run)")
     g.add_argument("--wandb-offline",  action="store_true")
 
     g = p.add_argument_group("Training budget")
@@ -452,6 +454,16 @@ class CurriculumWandbCallback(BaseCallback):
 def main():
     args = parse_args()
 
+    # ── Auto-detect latest checkpoint if resuming without explicit --resume ───
+    if args.wandb_id and not args.resume:
+        import glob as _glob
+        ckpts = sorted(_glob.glob(os.path.join(args.checkpoint_dir, "ppo_sb3_step*.zip")))
+        if ckpts:
+            args.resume = ckpts[-1]
+            print(f"  [RESUME] Auto-detected checkpoint: {args.resume}")
+        else:
+            print("  [RESUME] No checkpoints found — starting fresh with existing W&B run.")
+
     # ── W&B ──────────────────────────────────────────────────────────────────
     wandb_kwargs = dict(
         project = args.wandb_project,
@@ -460,6 +472,9 @@ def main():
         mode    = "offline" if args.wandb_offline else "online",
         sync_tensorboard = False,
     )
+    if args.wandb_id:
+        wandb_kwargs["id"]     = args.wandb_id
+        wandb_kwargs["resume"] = "must"
     run = wandb.init(**wandb_kwargs)
 
     wandb.define_metric("global_step")

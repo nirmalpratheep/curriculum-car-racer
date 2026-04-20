@@ -1,7 +1,7 @@
 uv run python -u training/train_torchrl.py \
   --num-envs 16 \
-  --rollout-steps 4096 \
-  --batch-size 512 \
+  --rollout-steps 8192 \
+  --batch-size 1024 \
   --ppo-epochs 10 \
   --compile \
   --video-interval 100000 \

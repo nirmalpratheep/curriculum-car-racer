@@ -42,6 +42,9 @@ import sys
 import time
 from collections import deque
 
+# Ensure project root (parent of training/) is on sys.path so env/ and game/ are importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 import torch.nn as nn

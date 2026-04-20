@@ -1,0 +1,11 @@
+name: curriculum-car-racer
+version: 0.1.0
+description: >
+  Pygame car racing with curriculum learning, egocentric vision,
+  and 20 procedural tracks. Agent observes a 64×64 headlight image
+  plus 9 scalar sensors (raycasts, speed, waypoint bearing) and
+  outputs continuous [accel, steer] actions.
+entry_point: env.server.app:app
+action_type: env.models:DriveAction
+observation_type: env.models:RaceObservation
+state_type: env.models:RaceState

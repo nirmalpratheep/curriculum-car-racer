@@ -1,4 +1,4 @@
-from .models import DriveAction, RaceObservation
+from .models import DriveAction, RaceObservation, RaceState
 from .environment import RaceEnvironment
 from .client import RaceEnvClient
 from .curriculum import CurriculumBuilder

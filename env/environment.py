@@ -11,12 +11,13 @@ from typing import Any, Optional
 import numpy as np
 import pygame
 
-from env._openenv_compat import Environment
+from openenv.core.env_server import Environment
+from openenv.core.env_server.types import EnvironmentMetadata
 
 from game.rl_splits import CarEnv
 from game.tracks import TrackDef, SCREEN_W, SCREEN_H
 from game.oval_racer import draw_headlights
-from .models import DriveAction, RaceObservation
+from .models import DriveAction, RaceObservation, RaceState
 
 # Egocentric view parameters
 _VIEW_PX = 120   # world-pixel square captured around the car before scaling
@@ -24,7 +25,7 @@ _OUT_PX  = 64    # output image size (64×64)
 _GRASS   = (45, 110, 45)
 
 
-class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
+class RaceEnvironment(Environment[DriveAction, RaceObservation, RaceState]):
     """
     Wraps game.rl_splits.CarEnv as an OpenEnv Environment.
 
@@ -44,6 +45,7 @@ class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
         laps_target: int = 3,
         use_image: bool = True,
     ):
+        super().__init__()  # OpenEnv base init (transform=None, rubric=None)
         self._env = CarEnv(track, max_steps=max_steps, laps_target=laps_target)
         self._use_image = use_image
         self._episode_id: Optional[str] = None
@@ -63,9 +65,11 @@ class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
         episode_id: Optional[str] = None,
         **kwargs: Any,
     ) -> RaceObservation:
+        self._reset_rubric()  # OpenEnv hook — reset rubric state if attached
         self._episode_id = episode_id
         obs = self._env.reset()
-        return self._to_obs(obs, done=False, reward=0.0)
+        result = self._to_obs(obs, done=False, reward=0.0)
+        return self._apply_transform(result)  # OpenEnv hook
 
     def step(
         self,
@@ -74,18 +78,35 @@ class RaceEnvironment(Environment[DriveAction, RaceObservation, dict]):
         **kwargs: Any,
     ) -> RaceObservation:
         obs, reward, done, info = self._env.step([action.accel, action.steer])
-        return self._to_obs(obs, done=done, reward=reward, metadata=info)
+        result = self._to_obs(obs, done=done, reward=reward, metadata=info)
+        return self._apply_transform(result)  # OpenEnv hook
 
     @property
-    def state(self) -> dict:
+    def state(self) -> RaceState:
         t = self._env.track
-        return {
-            "episode_id": self._episode_id,
-            "track_level": t.level,
-            "track_name": t.name,
-            "laps": self._env.laps,
-            "step": self._env._step,
-        }
+        return RaceState(
+            episode_id=self._episode_id,
+            step_count=self._env._step,
+            track_level=t.level,
+            track_name=t.name,
+            laps=self._env.laps,
+        )
+
+    def close(self) -> None:
+        """Clean up pygame offscreen surfaces."""
+        if self._use_image:
+            self._surf = self._canvas = self._cropped = self._scaled = None
+
+    def get_metadata(self) -> EnvironmentMetadata:
+        return EnvironmentMetadata(
+            name="CurriculumCarRacer",
+            description=(
+                "Pygame car racing with curriculum learning, egocentric vision, "
+                "and 20 procedural tracks. Agent observes a 64×64 headlight image "
+                "plus 9 scalar sensors (raycasts, speed, waypoint bearing)."
+            ),
+            version="0.1.0",
+        )
 
     # ── Image rendering ──────────────────────────────────────────────────────
 

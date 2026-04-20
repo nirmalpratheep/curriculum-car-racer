@@ -33,14 +33,14 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from pydantic import ConfigDict
-from env._openenv_compat import Action, Observation
+
+from openenv.core.env_server import Action, Observation, State
 
 
 class DriveAction(Action):
     """Continuous driving action."""
     accel: float             # -1 (brake) .. +1 (throttle)
     steer: float             # -1 (left)  .. +1 (right)
-    metadata: Dict[str, Any] = {}
 
 
 class RaceObservation(Observation):
@@ -86,3 +86,14 @@ class RaceObservation(Observation):
             self.wp_sin,
             self.wp_cos,
         ]
+
+
+class RaceState(State):
+    """OpenEnv State for the car racing environment.
+
+    Extends the base State (episode_id, step_count) with
+    track and progress information.
+    """
+    track_level: int = 0
+    track_name: str = ""
+    laps: int = 0

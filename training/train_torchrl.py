@@ -110,14 +110,14 @@ def parse_args():
     g.add_argument("--gae-lambda",    type=float, default=0.95)
     g.add_argument("--clip-eps",      type=float, default=0.2)
     g.add_argument("--vf-coef",       type=float, default=0.5)
-    g.add_argument("--ent-coef",      type=float, default=0.0)
+    g.add_argument("--ent-coef",      type=float, default=0.01)
     g.add_argument("--max-grad-norm", type=float, default=0.5)
     g.add_argument("--target-kl",     type=float, default=0.1,
                    help="Stop PPO epochs early when approx_kl exceeds this")
 
     g = p.add_argument_group("Curriculum")
     g.add_argument("--threshold",    type=float, default=30.0)
-    g.add_argument("--window",       type=int,   default=50)
+    g.add_argument("--window",       type=int,   default=20)
     g.add_argument("--replay-frac",  type=float, default=0.3)
 
     g = p.add_argument_group("Checkpointing")
@@ -425,21 +425,25 @@ def _iter_episodes(td):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(path, policy_module, value_module, optimizer,
-                    global_step, builder, args, reward_window, episode_num,
-                    wandb_run_id):
+                    global_step, builder, args, reward_window, frontier_reward_window,
+                    episode_num, wandb_run_id):
     torch.save({
-        "step":             global_step,
-        "curriculum_level": builder.current_level,
-        "policy":           policy_module.state_dict(),
-        "value":            value_module.state_dict(),
-        "optimizer":        optimizer.state_dict(),
-        "args":             vars(args),
-        "reward_window":    list(reward_window),
+        "step":                    global_step,
+        "curriculum_level":        builder.current_level,
+        "policy":                  policy_module.state_dict(),
+        "value":                   value_module.state_dict(),
+        "optimizer":               optimizer.state_dict(),
+        "args":                    vars(args),
+        "reward_window":           list(reward_window),
+        "frontier_reward_window":  list(frontier_reward_window),
         "episode_num":      episode_num,
-        "sampler_idx":      builder._sampler._idx,
-        "sampler_rewards":  list(builder._sampler._rewards),
-        "sampler_crashes":  list(builder._sampler._crashes),
-        "sampler_laps":     list(builder._sampler._laps),
+        "sampler_idx":              builder._sampler._idx,
+        "sampler_rewards":          list(builder._sampler._rewards),
+        "sampler_crashes":          list(builder._sampler._crashes),
+        "sampler_laps":             list(builder._sampler._laps),
+        "sampler_is_frontier":      list(builder._sampler._is_frontier),
+        "sampler_frontier_crashes": list(builder._sampler._frontier_crashes),
+        "sampler_frontier_laps":    list(builder._sampler._frontier_laps),
         "wandb_run_id":     wandb_run_id,
     }, path)
 
@@ -514,10 +518,13 @@ def main():
         use_image   = True,
     )
     if ckpt:
-        builder._sampler._idx     = ckpt["sampler_idx"]
-        builder._sampler._rewards = deque(ckpt["sampler_rewards"], maxlen=args.window)
-        builder._sampler._crashes = deque(ckpt.get("sampler_crashes", []), maxlen=args.window)
-        builder._sampler._laps    = deque(ckpt.get("sampler_laps",    []), maxlen=args.window)
+        builder._sampler._idx              = ckpt["sampler_idx"]
+        builder._sampler._rewards          = deque(ckpt["sampler_rewards"],                       maxlen=args.window)
+        builder._sampler._crashes          = deque(ckpt.get("sampler_crashes",          []),      maxlen=args.window)
+        builder._sampler._laps             = deque(ckpt.get("sampler_laps",             []),      maxlen=args.window)
+        builder._sampler._is_frontier      = deque(ckpt.get("sampler_is_frontier",      []),      maxlen=args.window)
+        builder._sampler._frontier_crashes = deque(ckpt.get("sampler_frontier_crashes", []),      maxlen=args.window)
+        builder._sampler._frontier_laps    = deque(ckpt.get("sampler_frontier_laps",    []),      maxlen=args.window)
 
     sampler = builder._sampler
 
@@ -538,8 +545,12 @@ def main():
     policy_module, value_module, encoder = build_policy_and_value(device)
 
     if ckpt:
-        policy_module.load_state_dict(ckpt["policy"])
-        value_module.load_state_dict(ckpt["value"])
+        def _strip_orig_mod(sd):
+            if any(k.startswith("_orig_mod.") for k in sd):
+                return {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
+            return sd
+        policy_module.load_state_dict(_strip_orig_mod(ckpt["policy"]))
+        value_module.load_state_dict(_strip_orig_mod(ckpt["value"]))
 
     # Sanity: run once through reset so specs match
     with torch.no_grad():
@@ -603,7 +614,8 @@ def main():
     # ── Counters ──────────────────────────────────────────────────────────────
     global_step   = ckpt["step"]         if ckpt else 0
     episode_num   = ckpt["episode_num"]  if ckpt else 0
-    reward_window = deque(ckpt["reward_window"] if ckpt else [], maxlen=args.window)
+    reward_window          = deque(ckpt["reward_window"]                    if ckpt else [], maxlen=args.window)
+    frontier_reward_window = deque(ckpt.get("frontier_reward_window", []) if ckpt else [], maxlen=args.window)
     update_num    = 0
     start_time    = time.time()
 
@@ -654,12 +666,16 @@ def main():
             reward_window.append(ep["ep_reward"])
             _log_ep_rewards.append(ep["ep_reward"])
             _log_ep_lengths.append(ep["ep_length"])
-            rolling_mean = statistics.mean(reward_window) if reward_window else 0.0
 
             frontier   = sampler.frontier_track
             threshold  = args.threshold * frontier.complexity
-            advanced   = builder.record(ep["ep_reward"], ep["ep_crashes"], ep["ep_laps"])
             is_replay  = (ep["track_level"] != frontier.level)
+            if not is_replay:
+                frontier_reward_window.append(ep["ep_reward"])
+            rolling_mean = statistics.mean(frontier_reward_window) if frontier_reward_window else 0.0
+
+            advanced   = builder.record(ep["ep_reward"], ep["ep_crashes"], ep["ep_laps"],
+                                        is_frontier=not is_replay)
 
             wandb.log({
                 "global_step":              global_step,
@@ -783,7 +799,7 @@ def main():
             ep_len_mean = float(np.mean(_log_ep_lengths)) if _log_ep_lengths else float("nan")
             sps_now     = global_step / max(time.time() - start_time, 1e-6)
             frontier    = sampler.frontier_track
-            win_clean   = sum(1 for l, c in zip(sampler._laps, sampler._crashes)
+            win_clean   = sum(1 for l, c in zip(sampler._frontier_laps, sampler._frontier_crashes)
                               if l >= 1 and c == 0)
 
             def _fmt(v, fmt=".3g"):
@@ -837,7 +853,7 @@ def main():
             save_checkpoint(
                 ckpt_path, policy_module, value_module, optimizer,
                 global_step, builder, args,
-                reward_window, episode_num, run.id,
+                reward_window, frontier_reward_window, episode_num, run.id,
             )
             wandb.save(ckpt_path)
             print(f"\n  [CKPT] {ckpt_path}")
@@ -866,7 +882,7 @@ def main():
     save_checkpoint(
         final, policy_module, value_module, optimizer,
         global_step, builder, args,
-        reward_window, episode_num, run.id,
+        reward_window, frontier_reward_window, episode_num, run.id,
     )
     wandb.save(final)
 

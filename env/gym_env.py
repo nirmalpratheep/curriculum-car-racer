@@ -62,9 +62,10 @@ class RaceGymEnv(gym.Env):
         self._sampler       = sampler
         self.frontier_level = frontier_level   # writable via set_attr in subprocess mode
         self._shared_level  = shared_level     # multiprocessing.Value for ParallelEnv mode
-        self._replay_frac   = replay_frac
-        self._max_steps     = max_steps
-        self._laps_target   = laps_target
+        self._replay_frac    = replay_frac
+        self._max_steps      = max_steps
+        self._laps_target    = laps_target
+        self._replay_counter = 0   # round-robin index for subprocess replay
         self._race_env: Optional[Any] = None
         self._current_track: Optional[Any] = None
 
@@ -169,7 +170,8 @@ class RaceGymEnv(gym.Env):
             len(TRAIN) - 1,
         ))
         if fl > 0 and random.random() < self._replay_frac:
-            idx = random.randint(0, fl - 1)   # replay a mastered track
+            idx = self._replay_counter % fl    # round-robin through mastered tracks
+            self._replay_counter += 1
         else:
             idx = fl                           # train on the frontier
         return TRAIN[idx]

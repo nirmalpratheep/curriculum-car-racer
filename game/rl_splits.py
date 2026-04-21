@@ -449,10 +449,15 @@ class CurriculumSampler:
         self.threshold    = threshold
         self.window       = window
         self.replay_frac  = replay_frac
-        self._idx         = 0              # current frontier index
+        self._idx            = 0              # current frontier index
+        self._replay_counter = 0              # round-robin index into mastered tracks
         self._rewards     = deque(maxlen=window)
-        self._crashes     = deque(maxlen=window)   # crashes per episode
-        self._laps        = deque(maxlen=window)   # laps completed per episode
+        self._crashes     = deque(maxlen=window)   # crashes per episode (all)
+        self._laps        = deque(maxlen=window)   # laps completed per episode (all)
+        self._is_frontier = deque(maxlen=window)   # True when episode was on frontier track
+        # Dedicated frontier-only deques so replay episodes never take up slots.
+        self._frontier_crashes = deque(maxlen=window)
+        self._frontier_laps    = deque(maxlen=window)
 
     @property
     def current_level(self):
@@ -471,27 +476,38 @@ class CurriculumSampler:
         return self.tracks[self._idx]
 
     def sample(self):
-        """Return the TrackDef to use for the next episode."""
+        """Return the TrackDef to use for the next episode.
+        Replay uses round-robin so every mastered track gets equal coverage,
+        preventing early tracks from being starved as the curriculum grows.
+        """
         if self._idx > 0 and random.random() < self.replay_frac:
-            return random.choice(self.mastered)
+            track = self.mastered[self._replay_counter % self._idx]
+            self._replay_counter += 1
+            return track
         return self.frontier_track
 
-    def record(self, episode_reward, episode_crashes=0, episode_laps=0):
+    def record(self, episode_reward, episode_crashes=0, episode_laps=0, is_frontier=True):
         """Call after each episode with the total reward, crash count, and lap count."""
         self._rewards.append(episode_reward)
         self._crashes.append(episode_crashes)
         self._laps.append(episode_laps)
+        self._is_frontier.append(is_frontier)
+        if is_frontier:
+            self._frontier_crashes.append(episode_crashes)
+            self._frontier_laps.append(episode_laps)
 
     def should_advance(self):
         """
-        True when every episode in the window completed a lap with zero crashes.
-        Both conditions must hold for every episode: laps >= 1 AND crashes == 0.
+        True when every episode in the frontier window (last `window` frontier
+        episodes) completed a lap with zero crashes.  Replay episodes have their
+        own slots and never displace frontier entries from the window.
         """
         if self._idx >= len(self.tracks) - 1:
             return False
-        if len(self._crashes) < self.window:
+        if len(self._frontier_crashes) < self.window:
             return False
-        return all(l >= 1 and c == 0 for l, c in zip(self._laps, self._crashes))
+        return all(l >= 1 and c == 0
+                   for l, c in zip(self._frontier_laps, self._frontier_crashes))
 
     def advance(self):
         """Move to the next track. Clears all rolling buffers."""
@@ -500,6 +516,9 @@ class CurriculumSampler:
             self._rewards.clear()
             self._crashes.clear()
             self._laps.clear()
+            self._is_frontier.clear()
+            self._frontier_crashes.clear()
+            self._frontier_laps.clear()
             return True
         return False
 

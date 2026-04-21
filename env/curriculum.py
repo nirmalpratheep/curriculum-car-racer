@@ -71,13 +71,13 @@ class CurriculumBuilder:
         track.build()
         return RaceEnvironment(track, self._max_steps, self._laps_target, self._use_image)
 
-    def record(self, episode_reward: float, episode_crashes: int = 0, episode_laps: int = 0) -> bool:
+    def record(self, episode_reward: float, episode_crashes: int = 0, episode_laps: int = 0, is_frontier: bool = True) -> bool:
         """
         Record the reward, crashes, and laps for the last episode.
         Automatically advances the frontier when the threshold is met.
         Returns True if the curriculum advanced.
         """
-        self._sampler.record(episode_reward, episode_crashes, episode_laps)
+        self._sampler.record(episode_reward, episode_crashes, episode_laps, is_frontier=is_frontier)
         if self._sampler.should_advance():
             return self._sampler.advance()
         return False

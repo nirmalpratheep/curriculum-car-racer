@@ -116,9 +116,13 @@ def parse_args():
                    help="Stop PPO epochs early when approx_kl exceeds this")
 
     g = p.add_argument_group("Curriculum")
-    g.add_argument("--threshold",    type=float, default=30.0)
-    g.add_argument("--window",       type=int,   default=20)
-    g.add_argument("--replay-frac",  type=float, default=0.3)
+    g.add_argument("--threshold",           type=float, default=30.0)
+    g.add_argument("--window",              type=int,   default=20)
+    g.add_argument("--replay-frac",         type=float, default=0.3)
+    g.add_argument("--eval-episodes",       type=int,   default=1,
+                   help="Greedy eval episodes run every --eval-interval-steps for curriculum gating")
+    g.add_argument("--eval-interval-steps", type=int,   default=25_000,
+                   help="Run greedy curriculum eval every N global steps")
 
     g = p.add_argument_group("Checkpointing")
     g.add_argument("--checkpoint-interval", type=int, default=500_000)
@@ -270,7 +274,8 @@ class _EpisodeStatsReader(BaseInfoDictReader):
 
 
 def make_vec_env(num_envs: int, max_steps: int, laps_target: int,
-                 replay_frac: float, device, shared_level: mp.Value):
+                 replay_frac: float, device, shared_level: mp.Value,
+                 shared_priority=None, shared_n_priority=None):
     """
     ParallelEnv of GymWrapper(RaceGymEnv) — each env runs in its own subprocess
     for parallel CPU stepping. Frontier level is shared via a multiprocessing.Value
@@ -278,12 +283,14 @@ def make_vec_env(num_envs: int, max_steps: int, laps_target: int,
     """
     def _factory():
         gym_env = RaceGymEnv(
-            sampler        = None,
-            frontier_level = 0,
-            replay_frac    = replay_frac,
-            max_steps      = max_steps,
-            laps_target    = laps_target,
-            shared_level   = shared_level,
+            sampler           = None,
+            frontier_level    = 0,
+            replay_frac       = replay_frac,
+            max_steps         = max_steps,
+            laps_target       = laps_target,
+            shared_level      = shared_level,
+            shared_priority   = shared_priority,
+            shared_n_priority = shared_n_priority,
         )
         wrapped = GymWrapper(gym_env, device="cpu")
         wrapped.set_info_dict_reader(_EpisodeStatsReader())
@@ -326,46 +333,41 @@ def log_inference_videos(
     os.makedirs(video_dir, exist_ok=True)
 
     policy_module.eval()
-    video_logs = {}
 
     frontier_track = TRAIN[builder.current_level]
-    for track in [frontier_track]:
-        track.build()
-        env      = RaceEnvironment(track, max_steps=3000, laps_target=1, use_image=True)
-        raw_obs  = env.reset()
-        frames   = [_game_frame(env)]
-        step     = 0
+    track = frontier_track
+    track.build()
+    env     = RaceEnvironment(track, max_steps=3000, laps_target=1, use_image=True)
+    raw_obs = env.reset()
+    frames  = [_game_frame(env)]
+    step    = 0
 
-        while not raw_obs.done:
-            img = (torch.from_numpy(raw_obs.image.copy())
-                   .float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device))
-            scalars = torch.tensor(raw_obs.scalars, dtype=torch.float32,
-                                   device=device).unsqueeze(0)
+    while not raw_obs.done:
+        img = (torch.from_numpy(raw_obs.image.copy())
+               .float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device))
+        scalars = torch.tensor(raw_obs.scalars, dtype=torch.float32,
+                               device=device).unsqueeze(0)
 
-            td = TensorDict({"image": img, "scalars": scalars}, batch_size=[1])
-            with set_exploration_type(ExplorationType.MEAN):
-                td = policy_module(td)
-            action = td.get("action")[0].clamp(-1.0, 1.0).cpu().numpy()
+        td = TensorDict({"image": img, "scalars": scalars}, batch_size=[1])
+        with set_exploration_type(ExplorationType.MEAN):
+            td = policy_module(td)
+        action = td.get("action")[0].clamp(-1.0, 1.0).cpu().numpy()
 
-            raw_obs = env.step(DriveAction(
-                accel=float(action[0]), steer=float(action[1])
-            ))
-            step += 1
-            if step % frame_skip == 0:
-                frames.append(_game_frame(env))
+        raw_obs = env.step(DriveAction(
+            accel=float(action[0]), steer=float(action[1])
+        ))
+        step += 1
+        if step % frame_skip == 0:
+            frames.append(_game_frame(env))
 
-        video      = np.stack(frames, axis=0)  # (T, 300, 450, 3) uint8
-        track_slug = track.name.replace(" ", "_")
-        filename   = f"step{global_step:08d}_track{track.level:02d}_{track_slug}.mp4"
-        iio.imwrite(os.path.join(video_dir, filename),
-                    video, fps=20, codec="libx264", plugin="pyav")
+    video      = np.stack(frames, axis=0)
+    track_slug = track.name.replace(" ", "_")
+    filename   = f"step{global_step:08d}_track{track.level:02d}_{track_slug}.mp4"
+    iio.imwrite(os.path.join(video_dir, filename),
+                video, fps=20, codec="libx264", plugin="pyav")
 
-        key = f"inference/track_{track.level:02d}_{track_slug}"
-        video_logs[key] = wandb.Video(video, fps=20, format="mp4")
-
-    wandb.log({**video_logs, "global_step": global_step}, step=global_step)
     policy_module.train()
-    print(f"  [VIDEO] Saved frontier track video to {video_dir}/")
+    print(f"  [VIDEO] Saved to {os.path.join(video_dir, filename)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +461,45 @@ def prune_checkpoints(checkpoint_dir: str, keep: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Greedy curriculum evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _greedy_eval(policy_module, track, device, n_episodes, max_steps=3000):
+    """
+    Run n_episodes greedy (MEAN action) episodes on track.
+    Returns list of dicts: {laps, crashes}.
+    Uses RaceEnvironment directly — no vectorisation overhead.
+    """
+    from env.environment import RaceEnvironment
+
+    policy_module.eval()
+    results = []
+    track.build()
+
+    for _ in range(n_episodes):
+        env     = RaceEnvironment(track, max_steps=max_steps, laps_target=1, use_image=True)
+        raw_obs = env.reset()
+
+        while not raw_obs.done:
+            img = (torch.from_numpy(raw_obs.image.copy())
+                   .float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device))
+            scalars = torch.tensor(raw_obs.scalars, dtype=torch.float32,
+                                   device=device).unsqueeze(0)
+            td = TensorDict({"image": img, "scalars": scalars}, batch_size=[1])
+            with set_exploration_type(ExplorationType.MEAN):
+                td = policy_module(td)
+            action  = td["action"][0].clamp(-1.0, 1.0).cpu().numpy()
+            raw_obs = env.step(DriveAction(accel=float(action[0]), steer=float(action[1])))
+
+        ce = env._env
+        results.append({"laps": ce._laps, "crashes": ce._crash_count})
+
+    policy_module.train()
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -530,14 +571,18 @@ def main():
 
     # ── Environment (torchrl) ─────────────────────────────────────────────────
     N = args.num_envs
-    shared_level = mp.Value("i", builder.current_level)
+    shared_level      = mp.Value("i", builder.current_level)
+    shared_priority   = mp.Array("i", [-1] * 10)   # TRAIN indices of failing tracks
+    shared_n_priority = mp.Value("i", 0)            # how many entries are valid
     vec_env = make_vec_env(
-        num_envs     = N,
-        max_steps    = 3000,
-        laps_target  = 1,
-        replay_frac  = args.replay_frac,
-        device       = device,
-        shared_level = shared_level,
+        num_envs          = N,
+        max_steps         = 3000,
+        laps_target       = 1,
+        replay_frac       = args.replay_frac,
+        device            = device,
+        shared_level      = shared_level,
+        shared_priority   = shared_priority,
+        shared_n_priority = shared_n_priority,
     )
     vec_env.set_seed(args.seed)
 
@@ -618,6 +663,10 @@ def main():
     frontier_reward_window = deque(ckpt.get("frontier_reward_window", []) if ckpt else [], maxlen=args.window)
     update_num    = 0
     start_time    = time.time()
+    greedy_clean  = 0   # result of last greedy eval (for display)
+    next_eval     = args.eval_interval_steps
+    while next_eval <= global_step:
+        next_eval += args.eval_interval_steps
 
     LOG_INTERVAL  = 25_000
     next_log      = LOG_INTERVAL
@@ -674,8 +723,8 @@ def main():
                 frontier_reward_window.append(ep["ep_reward"])
             rolling_mean = statistics.mean(frontier_reward_window) if frontier_reward_window else 0.0
 
-            advanced   = builder.record(ep["ep_reward"], ep["ep_crashes"], ep["ep_laps"],
-                                        is_frontier=not is_replay)
+            builder.record(ep["ep_reward"], ep["ep_crashes"], ep["ep_laps"],
+                           is_frontier=not is_replay)
 
             wandb.log({
                 "global_step":              global_step,
@@ -692,24 +741,6 @@ def main():
                 "curriculum/threshold":     threshold,
                 "curriculum/is_replay":     int(is_replay),
             }, step=global_step)
-
-            if advanced:
-                shared_level.value = builder.current_level  # propagate to all worker envs
-                new_frontier = sampler.frontier_track
-                print(
-                    f"\n  >>> CURRICULUM ADVANCE -> "
-                    f"Track {new_frontier.level} '{new_frontier.name}'  "
-                    f"[lvl {builder.current_level}/{len(TRAIN)-1}]  "
-                    f"rolling_mean={rolling_mean:.2f}  threshold={threshold:.2f}\n",
-                    flush=True,
-                )
-                wandb.log({
-                    "global_step":                  global_step,
-                    "curriculum/level":             builder.current_level,
-                    "curriculum/advanced_to_level": new_frontier.level,
-                    "curriculum/advanced_to_name":  new_frontier.name,
-                    "curriculum/advanced_to_tier":  difficulty_of(new_frontier),
-                }, step=global_step)
 
         # ── Compute GAE advantages & targets, then flatten for PPO ───────────
         with torch.no_grad():
@@ -814,7 +845,8 @@ def main():
                 ("   level",              f"{builder.current_level}/{len(TRAIN)-1}"),
                 ("   frontier_track",     f"{frontier.level} '{frontier.name}'"),
                 ("   rolling_mean",       _fmt(rolling_mean, ".2f")),
-                ("   clean_wins",         f"{win_clean}/{args.window}"),
+                ("   clean_wins",         f"{win_clean}/{args.window}  (stochastic)"),
+                ("   greedy_clean",       f"{greedy_clean}/{args.eval_episodes}  (eval)"),
                 ("time/",                ""),
                 ("   fps",                _fmt(sps_now, ".0f")),
                 ("   iterations",         str(update_num)),
@@ -843,6 +875,94 @@ def main():
             _log_ep_rewards.clear()
             _log_ep_lengths.clear()
             next_log += LOG_INTERVAL
+
+        # ── Greedy curriculum eval ────────────────────────────────────────────
+        if global_step >= next_eval:
+            tracks_to_eval = TRAIN[: builder.current_level + 1]
+            all_pass   = True
+            eval_log   = {}
+            n_passing  = 0
+            eval_passed: dict = {}   # tr → bool, used for priority replay update
+            print(f"\n  [EVAL] greedy eval — {len(tracks_to_eval)} track(s):", flush=True)
+
+            for tr in tracks_to_eval:
+                res   = _greedy_eval(policy_module, tr, device,
+                                     args.eval_episodes, max_steps=3000)
+                clean = sum(1 for r in res if r["laps"] >= 1 and r["crashes"] == 0)
+                ok    = (clean == args.eval_episodes)
+                n_passing += int(ok)
+                eval_passed[tr] = ok
+                if not ok:
+                    all_pass = False
+                print(f"         track {tr.level:02d} '{tr.name}': "
+                      f"{'PASS' if ok else 'FAIL'}  ({clean}/{args.eval_episodes})",
+                      flush=True)
+                eval_log[f"curriculum/greedy_track{tr.level:02d}"] = int(ok)
+
+            # Update priority replay: give failing tracks dedicated 30% of episodes.
+            failing_indices = [
+                i for i, tr in enumerate(tracks_to_eval) if not eval_passed[tr]
+            ]
+            n_fail = min(len(failing_indices), 10)
+            shared_n_priority.value = n_fail
+            for i, idx in enumerate(failing_indices[:10]):
+                shared_priority[i] = idx
+            if failing_indices:
+                fail_names = ", ".join(
+                    f"track {TRAIN[i].level}" for i in failing_indices[:10]
+                )
+                print(f"  [PRIO] priority replay set for {n_fail} failing track(s): {fail_names}",
+                      flush=True)
+            else:
+                print(f"  [PRIO] all tracks passed — priority replay cleared", flush=True)
+
+            wandb.log({"global_step":                  global_step,
+                       "curriculum/greedy_pass":       int(all_pass),
+                       "curriculum/greedy_n_pass":     n_passing,
+                       "curriculum/priority_n_tracks": n_fail,
+                       **eval_log}, step=global_step)
+
+            if all_pass:
+                shared_n_priority.value = 0   # all tracks passed — clear priority
+                advanced = builder._sampler.advance()
+                if advanced:
+                    shared_level.value = builder.current_level
+                    new_frontier = sampler.frontier_track
+                    print(
+                        f"\n  >>> GREEDY EVAL ADVANCE -> "
+                        f"Track {new_frontier.level} '{new_frontier.name}'  "
+                        f"[lvl {builder.current_level}/{len(TRAIN)-1}]\n",
+                        flush=True,
+                    )
+                    wandb.log({"global_step":                  global_step,
+                               "curriculum/level":             builder.current_level,
+                               "curriculum/advanced_to_level": new_frontier.level,
+                               "curriculum/advanced_to_name":  new_frontier.name},
+                              step=global_step)
+                else:
+                    print(
+                        f"\n  >>> CURRICULUM COMPLETE — all {len(TRAIN)} tracks mastered "
+                        f"at step {global_step:,}\n",
+                        flush=True,
+                    )
+                    wandb.log({"global_step": global_step,
+                               "curriculum/complete": 1}, step=global_step)
+
+                adv_path = os.path.join(
+                    args.checkpoint_dir,
+                    f"ppo_torchrl_advance_lvl{builder.current_level:02d}_step{global_step:08d}.pt",
+                )
+                save_checkpoint(
+                    adv_path, policy_module, value_module, optimizer,
+                    global_step, builder, args,
+                    reward_window, frontier_reward_window, episode_num, run.id,
+                )
+                print(f"  [CKPT] Advance checkpoint: {adv_path}", flush=True)
+
+                if not advanced:
+                    break  # curriculum complete — stop training
+
+            next_eval += args.eval_interval_steps
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt:

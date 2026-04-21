@@ -40,6 +40,34 @@ def _full_ellipse(cx, cy, rx, ry, n=80, start_deg=90):
     return _arc(cx, cy, rx, ry, start_deg, start_deg + 360, n)
 
 
+def _dense_poly(corners, step=20, segment_widths=None):
+    """
+    Sample a closed straight-segment polygon at ~step-px intervals.
+    Analogous to _arc() for polygon tracks: produces dense waypoints so the
+    +10 lookahead in CarEnv._obs() gives meaningful corner anticipation.
+
+    If segment_widths (one value per corner segment) is provided, returns
+    (waypoints, expanded_widths) with widths broadcast to the dense point list.
+    Otherwise returns just the waypoints list.
+    """
+    result = []
+    expanded_sw = [] if segment_widths is not None else None
+    n = len(corners)
+    for i in range(n):
+        x0, y0 = corners[i]
+        x1, y1 = corners[(i + 1) % n]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        n_pts = max(2, int(seg_len / step))
+        for k in range(n_pts):
+            t = k / n_pts
+            result.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
+        if expanded_sw is not None:
+            expanded_sw.extend([segment_widths[i]] * n_pts)
+    if segment_widths is not None:
+        return result, expanded_sw
+    return result
+
+
 def _ipts(pts):
     """Convert float point list to integer tuples."""
     return [(int(round(x)), int(round(y))) for x, y in pts]
@@ -385,12 +413,12 @@ def _build_all_tracks():
     # ── GROUP 4: Polygon tracks ──────────────────────────────────────────────
 
     # 13. L-Shape Circuit
-    wp = [
+    wp = _dense_poly([
         (750, 510), (150, 510),
         (150, 140), (410, 140),
         (410, 310), (590, 310),
         (590, 140), (750, 140),
-    ]
+    ], step=20)   # 8 corners → ~100 pts; +10 lookahead ≈ 200 px
     tracks.append(TrackDef(
         level=13, name="L-Shape Circuit",
         waypoints=wp, width=72,
@@ -398,10 +426,10 @@ def _build_all_tracks():
     ))
 
     # 14. T-Notch Circuit
-    wp = [
+    wp = _dense_poly([
         (780, 530), (120, 530), (120, 150), (360, 150),
         (360, 310), (540, 310), (540, 150), (780, 150),
-    ]
+    ], step=20)   # 8 corners → ~100 pts
     tracks.append(TrackDef(
         level=14, name="T-Notch Circuit",
         waypoints=wp, width=58,
@@ -409,20 +437,21 @@ def _build_all_tracks():
     ))
 
     # 15. Complex Circuit
-    wp = [
+    _complex_corners = [
         (750, 490), (580, 490), (545, 450),
         (190, 450), (125, 380), (125, 195), (195, 135),
         (375, 135), (415, 185), (415, 315), (475, 350),
         (650, 350), (700, 295), (700, 160), (760, 130),
         (825, 150), (825, 430),
     ]
+    wp = _dense_poly(_complex_corners, step=20)   # 17 corners → ~120 pts
     tracks.append(TrackDef(
         level=15, name="Complex Circuit",
         waypoints=wp, width=65,
         start_pos=(660, 490), start_angle=180, max_speed=4.5
     ))
 
-    # 16. Master Challenge (same waypoints as track 15, narrower)
+    # 16. Master Challenge (same layout as track 15, narrower)
     tracks.append(TrackDef(
         level=16, name="Master Challenge",
         waypoints=list(wp), width=50,
@@ -504,16 +533,15 @@ def _build_all_tracks():
     # Angular rectangular course with a wide bottom straight (70 px, main
     # catch-up zone) and two tight top-corridor segments (28 px chokes) flanking
     # a slightly wider inner notch (55 px, secondary catch-up pocket).
-    wp = [
+    # seg 0: bottom (wide)  seg 2: top-left choke  seg 4: notch pocket
+    # seg 6: top-right choke  other segs: medium transitions
+    wp, sw = _dense_poly([
         (760, 520), (140, 520),   # bottom straight  ← wide catch-up zone
         (140, 160),               # left side up
         (340, 160), (340, 340),   # inner notch left
         (560, 340), (560, 160),   # inner notch right
         (760, 160),               # right side top
-    ]
-    # seg 0: bottom (wide)  seg 2: top-left choke  seg 4: notch pocket
-    # seg 6: top-right choke  other segs: medium transitions
-    sw = [70, 40, 28, 40, 55, 40, 28, 40]
+    ], step=20, segment_widths=[70, 40, 28, 40, 55, 40, 28, 40])
     tracks.append(TrackDef(
         level=20, name="Canyon Pass",
         waypoints=wp, width=70,

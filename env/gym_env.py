@@ -57,11 +57,15 @@ class RaceGymEnv(gym.Env):
         max_steps: int = 3000,
         laps_target: int = 1,
         shared_level=None,
+        shared_priority=None,    # mp.Array('i', 10) — TRAIN indices of failing tracks
+        shared_n_priority=None,  # mp.Value('i')     — how many priority entries are valid
     ):
         super().__init__()
-        self._sampler       = sampler
-        self.frontier_level = frontier_level   # writable via set_attr in subprocess mode
-        self._shared_level  = shared_level     # multiprocessing.Value for ParallelEnv mode
+        self._sampler           = sampler
+        self.frontier_level     = frontier_level   # writable via set_attr in subprocess mode
+        self._shared_level      = shared_level     # multiprocessing.Value for ParallelEnv mode
+        self._shared_priority   = shared_priority
+        self._shared_n_priority = shared_n_priority
         self._replay_frac    = replay_frac
         self._max_steps      = max_steps
         self._laps_target    = laps_target
@@ -169,6 +173,13 @@ class RaceGymEnv(gym.Env):
             self._shared_level.value if self._shared_level is not None else self.frontier_level,
             len(TRAIN) - 1,
         ))
+
+        # Priority replay: give greedy-eval-failing tracks 30% of episodes.
+        n_prio = self._shared_n_priority.value if self._shared_n_priority is not None else 0
+        if n_prio > 0 and random.random() < 0.3:
+            prio_idx = self._shared_priority[random.randint(0, n_prio - 1)]
+            return TRAIN[prio_idx]
+
         if fl > 0 and random.random() < self._replay_frac:
             idx = self._replay_counter % fl    # round-robin through mastered tracks
             self._replay_counter += 1

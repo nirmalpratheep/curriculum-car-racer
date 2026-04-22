@@ -1,50 +1,69 @@
 ---
-title: "Teaching an RL Agent to Race from Scratch: Curriculum Learning with OpenEnv"
+title: "Teaching a Car to Race from Scratch with Curriculum RL and OpenEnv"
 thumbnail: /blog/assets/curriculum-car-racer/collage.gif
-# To publish on HuggingFace: upload inference_videos/collage.gif to
+# To publish: upload inference_videos/collage.gif to
 # https://huggingface.co/blog/assets/curriculum-car-racer/collage.gif
 authors:
   - user: NirmalPratheep
 ---
 
-# Teaching an RL Agent to Race from Scratch: Curriculum Learning with OpenEnv
+# 🏎️ Teaching a Car to Race from Scratch with Curriculum RL and OpenEnv
 
-*An OpenEnv Student Challenge submission — building a production-ready RL environment from the ground up, then solving it with TorchRL PPO.*
+## TL;DR
 
----
+A PPO agent learns to drive on 10 tracks of increasing difficulty — starting from random noise, ending with hairpin turns and chicane layouts — using only a 64×64 egocentric image and 9 sensor readings. No human demonstrations, no map, no privileged information. Just reward.
 
-What does it take to teach an AI agent to drive? Not with a map, not with pre-recorded human demonstrations, and not with privileged information about the track — just a small image, nine sensor readings, and a reward signal that says *"you crashed, try again."*
+The full environment is open-source, OpenEnv-compliant, and can be served as an HTTP API in one command:
 
-That was the challenge I set for myself: build a complete RL environment using OpenEnv, design a curriculum that lets an agent grow from helpless wandering to confident racing, and train a PPO policy that masters all 10 tracks without forgetting the earlier ones. This post walks through every decision — the environment design, the curriculum mechanics, the architecture, and the training innovations that made it work.
-
-![Agent driving all 10 curriculum tracks simultaneously](../inference_videos/collage.gif)
-
-*The final trained policy — zero crashes, at least one completed lap on every track, evaluated deterministically.*
-
----
-
-## The Problem: Why Curriculum Learning?
-
-Reinforcement learning from scratch is hard. A car racing agent faces a compounding challenge: it must simultaneously learn steering, speed control, crash avoidance, *and* track navigation — all from sparse reward. If you drop an untrained agent onto a tight hairpin track, it crashes immediately and learns almost nothing. The reward signal is too sparse for meaningful gradient flow.
-
-The solution is **curriculum learning**: start with the easiest possible version of the task and only advance when the agent has genuinely mastered it. The agent builds up generalizable driving skills on wide, forgiving ovals — then transfers those skills to progressively tighter corners, higher speeds, and more complex track geometries.
-
-This isn't a new idea in RL, but implementing it *robustly* — with automatic advancement, anti-forgetting replay, and regression recovery — is where the interesting engineering lives.
-
----
-
-## The Environment: 10 Tracks, 3 Difficulty Groups
-
-The simulation is built in **Pygame** with no ML dependencies. Each of the 10 tracks is a `TrackDef` — a procedurally generated centreline of waypoints that gets rendered into a dark-grey tarmac surface with white boundary lines and a checkered start/finish.
-
-```
-Group A — Easy ovals         (Tracks 1–4)   Width 115 → 58 px, speeds 3.0–4.5
-Group B — Rectangular shapes (Tracks 5–8)   First 90° corners, stadium curves
-Group C — Hairpins & chicanes(Tracks 9–10)  Hairpin reversals, S-bend chicane
+```bash
+uvicorn env.server.app:app --host 0.0.0.0 --port 8000
 ```
 
-| Track | Name | Width | Max Speed | Key Challenge |
-|-------|------|-------|-----------|---------------|
+**Final result: 10/10 tracks — zero crashes — in ~1.3M environment steps.**
+
+![Agent driving all 10 curriculum tracks](../inference_videos/collage.gif)
+
+---
+
+## Table of Contents
+
+- [The Problem with Hard Tasks from Day One](#the-problem-with-hard-tasks-from-day-one)
+- [The Environment: 10 Tracks, 3 Groups](#the-environment-10-tracks-3-groups)
+- [What Does the Agent See?](#what-does-the-agent-see)
+- [Reward Design: Getting the Scale Right](#reward-design-getting-the-scale-right)
+- [Architecture: ImpalaCNN + Shared Encoder](#architecture-impalacnn--shared-encoder)
+- [Training: Three-Layer Curriculum](#training-three-layer-curriculum)
+- [Results](#results)
+- [FAQ](#faq)
+- [Try It Yourself](#try-it-yourself)
+- [Learn More](#learn-more)
+
+---
+
+## The Problem with Hard Tasks from Day One
+
+Reinforcement learning from scratch is brutally hard when the task is too difficult from the start.
+
+Imagine dropping an untrained car-racing agent directly onto a tight hairpin track. It immediately crashes. The reward is −15 and the episode ends. The agent tries again, crashes again. After thousands of identical failures, the gradient says "don't move" — and it stops trying.
+
+The classic solution is **curriculum learning**: start with the easiest version of the task and only advance when the agent has genuinely mastered it. Build skills one layer at a time.
+
+But implementing curriculum learning *robustly* — with automatic gating, forgetting prevention, and regression recovery — is where the interesting engineering lives. This post walks through every design decision that made a real curriculum work, from first principles.
+
+---
+
+## The Environment: 10 Tracks, 3 Groups
+
+I built the simulation in **Pygame** with no ML dependencies. Each track is a `TrackDef` — a procedurally defined centreline of waypoints rendered into a dark-grey tarmac surface with white boundary lines and a checkered start/finish line.
+
+```
+Group A — Easy ovals           Tracks 1–4   Width: 115 → 58 px
+Group B — Rectangular shapes   Tracks 5–8   First 90° corners
+Group C — Hairpins & chicanes  Tracks 9–10  Hairpin reversals, S-bends
+```
+
+| # | Track | Road Width | Max Speed | Key Challenge |
+|---|-------|-----------|-----------|---------------|
 | 1 | Wide Oval | 115 px | 3.0 | Nothing — just drive |
 | 2 | Standard Oval | 85 px | 3.5 | Slightly narrower |
 | 3 | Narrow Oval | 58 px | 3.5 | Precision required |
@@ -56,30 +75,15 @@ Group C — Hairpins & chicanes(Tracks 9–10)  Hairpin reversals, S-bend chican
 | 9 | Hairpin Track | 75 px | 3.5 | Hairpin reversal |
 | 10 | Chicane Track | 70 px | 3.5 | S-bend chicane |
 
-Track complexity scales with road width and speed: `complexity = (base_width / road_width) × (speed / base_speed)`. This multiplier gates curriculum advancement — the agent needs a higher greedy-eval score on harder tracks before it's allowed to move on.
-
-### Car Physics
-
-The physics are intentionally simple and fast to simulate at scale:
+Track difficulty is computed as:
 
 ```
-ACCEL       = 0.13   px/step² forward acceleration
-BRAKE_DECEL = 0.22   px/step² braking
-FRICTION    = 0.038  px/step  passive drag
-STEER_DEG   = 2.7°   per unit steer input
+complexity = (base_width / road_width) × (max_speed / base_speed)
 ```
 
-Steering rate scales with speed (reduced to 30% at very low speed) — so the agent can't spin in place at full steer rate, which helps prevent a degenerate spinning-in-circles local optimum.
+This multiplier gates curriculum advancement — the agent needs stronger greedy-eval performance on harder tracks before it moves on.
 
-### OpenEnv Compliance
-
-The environment is fully compliant with the **OpenEnv** standard. Serving it as an HTTP API takes one command:
-
-```bash
-uvicorn env.server.app:app --host 0.0.0.0 --port 8000
-```
-
-Any OpenEnv client can then interact with it:
+The environment is fully compliant with the **OpenEnv** standard. Any client can connect over HTTP:
 
 ```python
 from openenv import connect
@@ -91,278 +95,283 @@ while not obs.done:
     obs = env.step(action)
 ```
 
-The `openenv.yaml` manifest declares the types so clients can auto-discover the environment's interface without reading the source code.
+Or use the Gymnasium wrapper directly for local training:
+
+```python
+from env.gym_env import RaceGymEnv
+
+env = RaceGymEnv(track_level=5)
+obs, info = env.reset()
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```
 
 ---
 
-## Observation Design: What Does the Agent See?
+## What Does the Agent See?
 
-The agent receives two inputs every step — fused by the encoder before reaching the actor and critic heads.
+The agent receives two inputs every step, fused by the encoder before the actor and critic heads.
 
-### 1. Egocentric Headlight Image (64×64 RGB)
+### 1. Egocentric Headlight Image — `(3, 64, 64)`
 
-The key design decision: the image is **always rotated so the car faces upward**. This makes the visual input invariant to absolute position and heading.
+The critical design decision: **the image is always rotated so the car faces upward**.
 
 ```
-Raw game state (x, y, angle)
-  → blit track surface to 900×600 offscreen canvas
-  → draw 60°-wide headlight cone, 60 px ahead
-  → crop 120×120 px centred on car (grass-padded at screen edges)
-  → rotate so car heading = UP
-  → re-crop 120×120 after rotation padding
+game state (x, y, angle)
+  → draw track + 60°-wide headlight cone to offscreen canvas
+  → crop 120×120 px centred on car (grass-padded at edges)
+  → rotate so heading = UP
+  → re-crop centre 120×120 after rotation
   → scale to 64×64
-  → array3d → (H, W, 3) uint8
 ```
 
-The network never has to learn "this pixel coordinate means I'm near the left wall." It only needs to learn "a bright boundary in the right half of my view means steer left." This is the same principle as egocentric observation in robotics — it dramatically improves sample efficiency and generalisation across tracks.
+This makes the visual input **invariant to absolute position and heading**. The CNN never learns "at pixel (450, 515), the track curves left." It only needs to learn "a white boundary approaching from the right half of the view means steer left." The effective training distribution is ~4× richer without any extra data — the same track looks different from every heading.
 
-### 2. Scalar Sensors (9 floats)
+### 2. Scalar Sensors — `(9,)`
 
 ```python
 [
-  angular_velocity,   # gyroscope — rotational speed
+  angular_velocity,   # gyroscope — how fast am I turning?
   speed,              # speedometer — speed / max_speed
-  ray_left,           # raycast at −90° (boundary distance, normalised 0→1)
-  ray_front_left,     # raycast at −45°
-  ray_front,          # raycast at   0° (straight ahead)
-  ray_front_right,    # raycast at  +45°
-  ray_right,          # raycast at  +90°
-  wp_sin,             # sin(bearing to next waypoint − car heading)
-  wp_cos,             # cos(bearing to next waypoint − car heading)
+  ray_left,           # wall distance at −90°  (normalised 0→1)
+  ray_front_left,     # wall distance at −45°
+  ray_front,          # wall distance at   0°  (straight ahead)
+  ray_front_right,    # wall distance at  +45°
+  ray_right,          # wall distance at  +90°
+  wp_sin,             # sin(bearing to next waypoint − current heading)
+  wp_cos,             # cos(bearing to next waypoint − current heading)
 ]
 ```
 
-The **5 raycasts** replaced an earlier binary `on_track` flag. With binary feedback, the agent only learns it's off-track *after* crashing. With raycasts, it can see a wall approaching at 100 px and start steering away — the difference between an anticipatory driver and a reactive one.
+Two design choices here that made a real difference:
 
-The **waypoint bearing** (`wp_sin`, `wp_cos`) acts as a relative GPS compass. It points toward the centreline 10 waypoints ahead, in coordinates relative to the car's current heading. `wp_cos ≈ 1` means the waypoint is straight ahead; `wp_sin < 0` means it's to the left. This gives the agent intentional directional signal even in the middle of a straight — without exposing raw map coordinates.
+**Raycasts instead of a binary `on_track` flag.** The original environment had a single boolean: are you on track? The agent only learned it had crashed *after* crashing. Replacing this with 5 raycasts means the agent can *see* a wall approaching at 80 px and start steering away. The difference between reactive and anticipatory driving.
+
+**Waypoint bearing as a relative GPS compass.** Early experiments included raw waypoint coordinates `(x, y)`. These don't transfer across tracks — "waypoint at (700, 300) means go right" is meaningless on Track 9. The `(wp_sin, wp_cos)` encoding is track-agnostic: it only says *where the track goes relative to where I'm pointing*. `wp_cos ≈ 1` means the track is straight ahead. `wp_sin < 0` means it bends left. This encoding is what enables the same policy to generalise across all 10 tracks.
 
 ---
 
-## Reward Design: Keeping Gradients Meaningful
+## Reward Design: Getting the Scale Right
 
-Early experiments used large reward magnitudes (±300 for crashes, +200 for lap completion). Value function targets in that range cause value loss to dominate the gradient, which crowds out the policy loss signal and causes entropy collapse. The final reward table uses magnitudes 1/20 of those initial values:
+Early experiments used large reward magnitudes — ±300 for crashes, +200 for lap completion. The result: value function targets in the hundreds caused value loss to completely dominate the gradient. The policy barely updated because all gradient budget was spent fitting the value function.
 
-| Event | Reward | Purpose |
-|-------|--------|---------|
-| Every step | −0.005 | Efficiency pressure |
+The fix: scale everything down so rewards stay in **[−15, +10]**.
+
+| Event | Reward | Why |
+|-------|--------|-----|
+| Every step | −0.005 | Efficiency pressure — don't dawdle |
 | Forward speed | `speed_norm × 0.10` | Must move to earn reward |
 | Reverse speed | `speed_norm × 0.10` (negative) | Penalise going backwards |
-| Waypoint advance | +0.25 per wp | Dense signal toward lap completion |
-| Waypoint regress | −0.25 per wp | Wrong-way penalty |
-| Lap completed | **+10.0** | Major bonus |
+| Waypoint advance | **+0.25** per waypoint | Dense directional signal |
+| Waypoint regress | **−0.25** per waypoint | Wrong-way penalty |
+| Lap completed | **+10.0** | Major completion bonus |
 | Crash / off-track | **−15.0**, done | Hard deterrent |
 | Out of bounds | **−15.0**, done | Stay on screen |
 
-The waypoint progress reward was the single most impactful addition. Without it, the only lap signal is the +10 bonus at the finish line — extremely sparse for a 3000-step episode. With +0.25 per waypoint crossed, the agent gets a gradient *in the direction of the finish line* on every step of every episode, even episodes it never completes.
+The **waypoint progress reward** was the single most impactful addition. Without it, the only lap signal is the +10 bonus at the finish line — extremely sparse for a 3000-step episode where most early episodes never complete a lap. With +0.25 per waypoint, the agent gets a gradient *pointing toward the finish line* on every step of every episode, even episodes it never completes.
 
 ### Lap Detection: No Shortcuts
 
-A naive "did the car cross the start line" check is easy to exploit. The final implementation uses a two-phase arm/trigger gate:
+A naive "did the car cross the start line" check is trivially exploited. The final implementation uses a two-phase arm/trigger gate:
 
-1. **Arm**: Car must travel >50 px *past* the start line going forward
-2. **Trigger**: Car must cross back through the start line with `speed > 0.3` AND having covered ≥80% of the track's optimal lap distance
+1. **Arm phase**: Car must travel >50 px *past* the start line in the forward direction
+2. **Trigger phase**: Car must cross back through the start line with `speed > 0.3` **and** having covered ≥80% of the track's optimal lap distance
 
-The 80% distance gate makes shortcutting across the infield impossible — the car genuinely has to drive the track.
+The 80% distance check makes shortcutting the infield physically impossible — the car genuinely has to drive the full track.
 
 ---
 
-## Model Architecture: ImpalaCNN + Shared Encoder
+## Architecture: ImpalaCNN + Shared Encoder
 
 ```
 image (3, 64, 64) ──► ImpalaCNN
-                       Block 1: Conv(3→16)  → MaxPool → ResBlock × 2
-                       Block 2: Conv(16→32) → MaxPool → ResBlock × 2
-                       Block 3: Conv(32→32) → MaxPool → ResBlock × 2
-                       Flatten(2048) → Linear → ReLU ──────────► 256-d
-                                                                     │
-scalars (9,) ──────► MLP: Linear(9→32) → ReLU → Linear(32→32) ─► 32-d
-                                                                     │
-                                                              Concat 288-d
-                                                              (RaceEncoder)
-                                                                     │
-                                              ┌──────────────────────┤
-                                         Actor head            Critic head
-                                      Linear(288→2)           Linear(288→1)
-                                      + log_std (param)        scalar V(s)
-                                      IndependentNormal
-                                      → [accel, steer]
+                       Block 1: Conv(3→16)  + MaxPool + ResBlock × 2
+                       Block 2: Conv(16→32) + MaxPool + ResBlock × 2
+                       Block 3: Conv(32→32) + MaxPool + ResBlock × 2
+                       Flatten → Linear → ReLU ───────────────► 256-d
+                                                                    │
+scalars (9,) ──────► MLP: Linear(9→32) → ReLU → Linear(32→32) ► 32-d
+                                                                    │
+                                                          [Concat] 288-d
+                                                        (RaceEncoder)
+                                                                    │
+                                         ┌──────────────────────────┤
+                                    Actor head                Critic head
+                                 Linear(288→2)              Linear(288→1)
+                                 + log_std param             scalar V(s)
+                                 IndependentNormal
+                                 → [accel, steer]
 ```
 
 ### Why ImpalaCNN over Nature CNN?
 
-Nature CNN (3 conv layers, no skip connections) is the standard for Atari-scale inputs. ImpalaCNN adds **residual skip connections** in each block: `output = x + conv_block(x)`. This gives gradients a direct path from the actor/critic heads back to the early convolution layers — with Nature CNN on long networks, gradients vanish before reaching the early layers.
+Nature CNN (3 conv layers, no skip connections) is the standard Atari baseline. I tried it first — the agent stalled on Track 3. The culprit: without skip connections, gradients vanish before reaching the early conv layers. The first-layer filters stop learning after a few hundred thousand steps.
 
-In practice: ImpalaCNN converges in ~3–5× fewer environment steps on this task. At the same inference cost per step, the wall-clock training time dropped from several days to a few hours.
+ImpalaCNN adds **residual connections** in each block: `output = x + conv_block(x)`. Gradients flow directly from the actor/critic heads back to the earliest filters. In practice, this converged in ~3–5× fewer environment steps for the same wall-clock inference cost.
 
 ### Initialisation Details
 
-Small but impactful:
-- **Orthogonal init** for all linear layers (gain √2 for encoder layers)
-- **Actor head** gain 0.01 — very small initial action means (near-zero mean accel/steer), preventing the agent from immediately driving full-speed into a wall
-- **Actor bias[0] = 0.3** — gentle initial forward acceleration, so the car is moving from step 1 rather than sitting still
-- **Log-std = −1.0** initially (std ≈ 0.37) — moderate initial exploration, not too random
+Small choices, large impact:
+
+- **Orthogonal init** (gain √2 for encoder layers) — prevents gradient vanishing at init
+- **Actor head gain 0.01** — very small initial action means, so the car doesn't immediately drive full-speed into a wall on step 1
+- **Actor bias[0] = 0.3** — gentle initial forward acceleration; without this, the car often sits still during early exploration and learns nothing
+- **Log-std = −1.0** initially (std ≈ 0.37) — moderate exploration, not so random the agent can't get off the start line
 
 ---
 
-## Training: TorchRL PPO with Curriculum Gating
-
-Training uses [TorchRL](https://github.com/pytorch/rl) PPO with 16 parallel worker processes:
+## Training: Three-Layer Curriculum
 
 ```bash
 uv run python -u training/train_torchrl.py \
-  --num-envs 16       \   # 16 parallel workers
-  --rollout-steps 8192 \  # frames before each PPO update
-  --batch-size 1024    \  # PPO minibatch size
-  --ppo-epochs 10      \  # passes per rollout
-  --compile               # torch.compile for ~30% throughput boost
+  --num-envs 16        \   # parallel workers
+  --rollout-steps 8192  \  # frames before each PPO update
+  --batch-size 1024     \  # PPO minibatch size
+  --ppo-epochs 10       \  # passes per rollout
+  --compile                # torch.compile (~30% throughput boost)
 ```
 
-### The Three-Layer Curriculum
+The curriculum has three interlocking mechanisms. All three are necessary — any one alone is insufficient.
 
-The curriculum has three interlocking mechanisms:
+### Layer 1 — Greedy Evaluation Gating
 
-**1. Greedy Evaluation Gating**
+Every 25k steps, all 10 tracks are evaluated with a **deterministic** (greedy) policy — no exploration noise. A track passes if the agent completes ≥1 lap with 0 crashes. The curriculum frontier advances only when every track up to the current one passes. If all 10 pass simultaneously, training stops.
 
-Every 25k steps, all 10 tracks are evaluated with a deterministic (greedy) policy — no exploration noise. A track *passes* if the agent completes ≥1 lap with 0 crashes. The frontier advances only when every track up to the current one passes. If all 10 pass simultaneously, training terminates.
+Why greedy eval instead of training reward? Training reward mixes exploration noise — the agent might get lucky. Greedy eval measures what the policy *actually* knows.
 
-This is stricter than using the rolling training reward (which mixes exploration noise). Greedy eval measures what the policy *actually* knows, not how lucky it got.
-
-**2. Anti-Forgetting Replay**
+### Layer 2 — Anti-Forgetting Replay
 
 ```
 70% of episodes → current frontier track
 30% of episodes → round-robin through all mastered tracks
 ```
 
-Round-robin means each mastered track gets equal coverage — early tracks don't get starved as the curriculum grows. Without this, the agent reliably regresses on Track 1 by the time it reaches Track 7.
+Without replay, the agent reliably regresses on Track 1 by the time it reaches Track 7. Catastrophic forgetting is fast — within 200k steps, early skills dissolve if never practised.
 
-**3. Priority Replay**
+Round-robin (rather than uniform random) ensures every mastered track gets equal coverage. With uniform sampling, later-mastered tracks crowd out the earlier ones as the mastered set grows.
 
-When greedy eval finds a regression (a previously mastered track now failing), that track is written to a shared memory array. All worker processes check this array and dedicate an additional 30% of their episodes to priority-replaying the failing track. Regressions are typically recovered within one 25k-step eval interval.
+To make this concrete — imagine the agent is on Track 7. The round-robin schedule over the 30% replay budget looks like:
+
+```
+Episode 1: frontier (Track 7)
+Episode 2: frontier (Track 7)
+Episode 3: replay   (Track 1)  ← round-robin: 1, 2, 3, 4, 5, 6, 1, 2, ...
+Episode 4: frontier (Track 7)
+Episode 5: frontier (Track 7)
+Episode 6: replay   (Track 2)
+...
+```
+
+Every mastered track is visited in turn, regardless of how many there are.
+
+### Layer 3 — Priority Replay
+
+When greedy eval discovers a regression (a previously-passing track now failing), that track is written to a shared memory array. All 16 worker processes check this array and dedicate an additional 30% of their episodes to the failing track — on top of normal replay.
+
+Without this, regressions persist for 5–10 eval intervals. With priority replay, they're typically recovered within 1–2 intervals. The curriculum stays monotonically advancing rather than oscillating.
 
 ### W&B Training Curves
+
+The curriculum level stepping is clearly visible in the episode reward chart — each plateau is the agent consolidating skills on a new frontier track, each jump is advancement.
 
 ![Episode metrics — reward, laps, crashes across curriculum](Training-Episode-wandb.png)
 
 ![PPO internals — value loss, policy loss, entropy, explained variance](Training-PPO-wandb.png)
 
-The curriculum level stepping is clearly visible in the episode reward chart — each plateau is the agent consolidating skills on a new frontier track, and each jump is when it advances. The PPO entropy chart shows healthy exploration throughout (no entropy collapse), and explained variance rises toward 0.9+ as the value function accurately models the curriculum.
-
----
-
-## Key Innovations
-
-### 1. Egocentric Rotation as Data Augmentation
-
-Rotating the observation so the car always faces up is equivalent to a learned data augmentation that's built directly into the environment rendering. It means the CNN never needs to learn "I'm in the top-left corner of the screen and about to hit the wall" — it only needs to learn "there's a wall in the upper-left of my view." The effective training distribution is ~4× richer for free.
-
-### 2. Waypoint GPS as Relative Compass
-
-Early experiments included raw waypoint coordinates in the scalar vector. These don't transfer across tracks — a policy trained on Track 1 learns "the waypoint at (700, 300) means go right" which is meaningless on Track 9.
-
-The `(wp_sin, wp_cos)` encoding is track-agnostic: it only encodes *where the track goes relative to where I'm pointing*, not where I am in absolute space. This is the key to cross-track generalisation.
-
-### 3. Soft Curriculum with Anti-Forgetting
-
-The 70/30 split between frontier and replay was tuned empirically. Lower replay fractions (e.g., 90/10) caused clear catastrophic forgetting — the agent would master Track 7 but crash on Track 1. Higher replay fractions (e.g., 50/50) slowed frontier progress significantly. 70/30 with round-robin distribution hit the sweet spot.
-
-### 4. Priority Replay for Regression Recovery
-
-Without priority replay, a regression on an early track would typically persist for 5–10 eval intervals before being recovered. With priority replay, the agent re-encounters the failing track immediately and recovers within 1–2 intervals. This makes the curriculum monotonically advancing rather than oscillating.
-
-### 5. Scaled Reward Magnitudes
-
-Keeping all rewards in [−15, +10] was non-obvious but critical. Value function targets in this range let the critic converge quickly (explained variance > 0.8 within 200k steps). Larger magnitudes caused value loss to overwhelm the policy gradient — the policy would barely update because the gradient was dominated by trying to fit the value function.
+The explained variance chart is the clearest health signal: it rises to >0.85 within 200k steps per frontier, showing the value function accurately models the curriculum. If it drops below 0.5, the reward scale is wrong or the network capacity is insufficient.
 
 ---
 
 ## Results
 
-The final policy, evaluated deterministically on all 10 tracks:
+Deterministic (greedy) evaluation on all 10 tracks, final checkpoint:
 
-| Track | Laps | Crashes | Status |
-|-------|------|---------|--------|
-| 1 — Wide Oval | 1 | 0 | ✅ PASS |
-| 2 — Standard Oval | 1 | 0 | ✅ PASS |
-| 3 — Narrow Oval | 1 | 0 | ✅ PASS |
-| 4 — Superspeedway | 1 | 0 | ✅ PASS |
-| 5 — Rounded Rectangle | 1 | 0 | ✅ PASS |
-| 6 — Stadium Oval | 1 | 0 | ✅ PASS |
-| 7 — Tight Rectangle | 1 | 0 | ✅ PASS |
-| 8 — Small Oval | 1 | 0 | ✅ PASS |
-| 9 — Hairpin Track | 1 | 0 | ✅ PASS |
-| 10 — Chicane Track | 1 | 0 | ✅ PASS |
+| Track | Laps | Crashes | |
+|-------|------|---------|--|
+| 1 — Wide Oval | 1 | 0 | ✅ |
+| 2 — Standard Oval | 1 | 0 | ✅ |
+| 3 — Narrow Oval | 1 | 0 | ✅ |
+| 4 — Superspeedway | 1 | 0 | ✅ |
+| 5 — Rounded Rectangle | 1 | 0 | ✅ |
+| 6 — Stadium Oval | 1 | 0 | ✅ |
+| 7 — Tight Rectangle | 1 | 0 | ✅ |
+| 8 — Small Oval | 1 | 0 | ✅ |
+| 9 — Hairpin Track | 1 | 0 | ✅ |
+| 10 — Chicane Track | 1 | 0 | ✅ |
 
-**10/10 tracks — zero crashes, minimum one lap — in ~1.3M environment steps.**
+**10/10 PASS** — ~1.3M environment steps — ~1–3 hours on a single GPU with 16 workers.
 
-Training on 16 parallel workers with `torch.compile` takes approximately 1–3 hours on a single GPU.
+---
+
+## FAQ
+
+**1. Why not just train on all 10 tracks simultaneously from the start?**
+
+I tried this. The agent converges on Track 1 (wide oval) and never escapes. The gradient signal from Track 10 (chicane) is pure noise when the agent has zero driving skill — it drowns the useful signal from Track 1 rather than complementing it. Curriculum pacing ensures the difficulty increases only once the agent is ready.
+
+**2. Does the waypoint GPS make the agent cheat the reward?**
+
+The GPS (`wp_sin`, `wp_cos`) points toward the track centreline ahead. It doesn't tell the agent where the start line is or when a lap is complete — that's detected separately by the gate arm/trigger mechanism. The GPS just says "the road bends slightly left" — the same information a real car's navigation would provide.
+
+**3. Why does the egocentric image face upward rather than forward?**
+
+"Forward" in the image *is* up — the image is rotated so the car always appears to drive toward the top of the frame. This makes the visual representation of "I'm about to hit a wall on the left" identical regardless of whether you're on the left straight, the right straight, or any curve. A CNN trained on this generalises to every track orientation automatically.
+
+**4. Can this agent drive on a track it was never trained on?**
+
+Partially. The features it has learned — "slow down when the wall is close," "follow the centreline bearing," "don't reverse" — are genuinely general. On a new oval it would likely succeed. On a track with a layout completely unlike any of the 10 (e.g., a figure-8 with an intersection), it would probably fail. A larger, more diverse curriculum would help here.
+
+**5. Why TorchRL over stable-baselines3 or CleanRL?**
+
+TorchRL's `ParallelEnv` and `tensordict` integration made scaling to 16 workers and batching rollouts from a Gymnasium `Dict` observation space straightforward. The same PPO loop works whether you use 1 worker or 32. CleanRL is excellent for single-environment baselines — I used it in early prototyping — but TorchRL scales better for this curriculum setup.
 
 ---
 
 ## Try It Yourself
-
-Everything is open source. You can run the trained agent in 3 commands:
 
 ```bash
 git clone https://github.com/NirmalPratheep/curriculum-car-racer
 cd curriculum-car-racer
 uv sync
 
-# Inference on all 10 tracks
+# Watch the trained agent on all 10 tracks (saves MP4s + rebuilds GIF)
 uv run python inference/inference.py \
   --checkpoint checkpoints/ppo_torchrl_final.pt
-```
 
-Or play interactively yourself:
+# Play interactively yourself (arrow keys)
+uv run python main.py        # Track 1 — Wide Oval
+uv run python main.py 9      # Track 9 — Hairpin
 
-```bash
-uv run python main.py    # Track 1 — Wide Oval
-uv run python main.py 9  # Track 9 — Hairpin
-```
-
-Or train from scratch:
-
-```bash
+# Train from scratch (~1–3 hours on GPU)
 bash training/cmd
-```
 
-The environment itself is also usable independently via OpenEnv:
-
-```bash
-# Start the API server
+# Serve as an OpenEnv HTTP API
 uvicorn env.server.app:app --host 0.0.0.0 --port 8000
-
-# Connect from any OpenEnv client
-python -c "
-from openenv import connect
-env = connect('http://localhost:8000')
-obs = env.reset()
-print(obs.image.shape, obs.wp_cos)
-"
 ```
 
 ---
 
-## What I Would Do Next
-
-**Richer observations**: The current 5-ray sensor gives good boundary detection but misses detail around tight corners. A 12-ray or 180° sweep would help with the chicane.
-
-**Multi-agent**: The OpenEnv architecture supports multiple simultaneous clients. Adding a second car as an obstacle (or a racing opponent) would make the task significantly harder and more interesting.
-
-**Continuous curriculum**: Instead of discrete frontier advancement, sample tracks according to a probability distribution that concentrates on the current difficulty boundary — similar to automatic curriculum generation (ACG) or teacher-student setups.
-
-**Sim-to-real transfer**: The physics model is simple enough that the observation design (egocentric image + relative GPS) should transfer to a real remote-controlled car with a camera and proximity sensors.
-
----
-
-## Links
+## Learn More
 
 - **GitHub**: [NirmalPratheep/curriculum-car-racer](https://github.com/NirmalPratheep/curriculum-car-racer)
 - **HuggingFace Hub**: [NirmalPratheep/curriculum-car-racer](https://huggingface.co/NirmalPratheep/curriculum-car-racer)
-- **OpenEnv**: [openenv.dev](https://openenv.dev)
-- **TorchRL**: [pytorch/rl](https://github.com/pytorch/rl)
+- **OpenEnv**: [openenv.dev](https://openenv.dev) — the environment standard used in this project
+- **TorchRL**: [pytorch/rl](https://github.com/pytorch/rl) — PPO implementation
+- **ImpalaCNN**: [IMPALA: Scalable Distributed Deep-RL](https://arxiv.org/abs/1802.01561), Espeholt et al., 2018
+- **Curriculum Learning**: [Curriculum Learning](https://dl.acm.org/doi/10.1145/1553374.1553380), Bengio et al., 2009
 
 ---
 
-*Submitted to the OpenEnv Student Challenge, April 2026.*
-*All code, weights, and training logs are open source.*
+## Citation
+
+```bibtex
+@misc{pratheep2026curriculumcarracer,
+  title   = {Curriculum Car Racer: Automated Curriculum RL with OpenEnv},
+  author  = {Nirmal Pratheep},
+  year    = {2026},
+  url     = {https://github.com/NirmalPratheep/curriculum-car-racer}
+}
+```
+
+---
+
+*OpenEnv Student Challenge submission — April 2026.*
